@@ -1,0 +1,37 @@
+[workspace]
+members = ["sputnik_gui"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["krozzzis"]
+edition = "2024"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 2
+lto = false
+codegen-units = 16
+panic = "unwind"
+strip = false
+
+[profile.production]
+inherits = "release"
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false
+debug = false
+
+[workspace.dependencies.tracing]
+version = "0.1"
+
+[workspace.dependencies.anyhow]
+version = "1.0"
