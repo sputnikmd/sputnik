@@ -1,35 +1,42 @@
 use std::marker::PhantomData;
-use std::sync::Arc;
 
-use iced::Element;
 use iced::widget::text::Span;
 use iced::widget::{column, text};
+use iced::Element;
+use ropey::Rope;
 
 use crate::widgets::EditorParagraph;
 
 pub enum Action {
     MoveCursorLeft,
     MoveCursorRight,
+    Insert(char),
+    DeleteBackward,
+    DeleteForward,
 }
 
-pub struct Editor<'a, Message> {
-    buffer: Arc<String>,
-    span_cache: Vec<Span<'a, (), iced::Font>>,
+pub struct Editor<Message> {
+    buffer: Rope,
     cursor: usize,
-    char_count: usize,
+    cached_flat: Vec<Span<'static, (), iced::Font>>,
+    #[allow(dead_code)]
+    cached_lines: Vec<Vec<Span<'static, (), iced::Font>>>,
+    _buffer_revision: usize,
     _phantom_data: PhantomData<Message>,
 }
 
-impl<'a, Message: 'a> Editor<'a, Message> {
-    pub fn new(buffer: Arc<String>) -> Editor<'a, Message> {
-        let span = Span::new((*buffer).clone());
-        let char_count = buffer.chars().count();
+const INITIAL_REVISION: usize = 1;
+
+impl<Message> Editor<Message> {
+    pub fn new(buffer: Rope) -> Editor<Message> {
+        let (cached_flat, cached_lines) = build_cache(&buffer);
 
         Self {
             buffer,
-            span_cache: vec![span],
             cursor: 0,
-            char_count,
+            cached_flat,
+            cached_lines,
+            _buffer_revision: INITIAL_REVISION,
             _phantom_data: PhantomData,
         }
     }
@@ -40,34 +47,82 @@ impl<'a, Message: 'a> Editor<'a, Message> {
                 self.cursor = self.cursor.saturating_sub(1);
             }
             Action::MoveCursorRight => {
-                self.cursor = (self.cursor + 1).min(self.char_count);
+                let max = self.buffer.len_chars();
+                self.cursor = (self.cursor + 1).min(max);
+            }
+            Action::Insert(ch) => {
+                let byte_pos = self.buffer.char_to_byte(self.cursor);
+                self.edit(|rope| rope.insert(byte_pos, ch.encode_utf8(&mut [0; 4])));
+                self.cursor += 1;
+            }
+            Action::DeleteBackward => {
+                if self.cursor > 0 {
+                    let byte_start = self.buffer.char_to_byte(self.cursor - 1);
+                    let byte_end = self.buffer.char_to_byte(self.cursor);
+                    let idx = self.cursor;
+                    self.edit(|rope| rope.remove(byte_start..byte_end));
+                    self.cursor = idx - 1;
+                }
+            }
+            Action::DeleteForward => {
+                if self.cursor < self.buffer.len_chars() {
+                    let byte_start = self.buffer.char_to_byte(self.cursor);
+                    let byte_end = self.buffer.char_to_byte(self.cursor + 1);
+                    self.edit(|rope| rope.remove(byte_start..byte_end));
+                }
             }
         }
     }
 
-    fn cursor_byte_offset(&self) -> usize {
-        self.buffer
-            .char_indices()
-            .nth(self.cursor)
-            .map(|(offset, _)| offset)
-            .unwrap_or(self.buffer.len())
+    pub fn edit(&mut self, f: impl FnOnce(&mut Rope)) {
+        f(&mut self.buffer);
+        self._buffer_revision += 1;
+        (self.cached_flat, self.cached_lines) = build_cache(&self.buffer);
+        self.cursor = self.cursor.min(self.buffer.len_chars());
     }
 
-    pub fn to_element<'b>(&'b self) -> Element<'b, Message>
-    where
-        'a: 'b,
-    {
+    fn cursor_byte_offset(&self) -> usize {
+        self.buffer.char_to_byte(self.cursor)
+    }
+
+    pub fn to_element<'b>(&'b self) -> Element<'b, Message> {
         let byte_cursor = self.cursor_byte_offset();
+        let total_chars = self.buffer.len_chars();
 
         let text_widget =
-            EditorParagraph::with_spans(self.span_cache.as_slice(), Some(byte_cursor))
+            EditorParagraph::with_spans(self.cached_flat.as_slice(), Some(byte_cursor))
                 .size(24.0)
                 .cursor_color(iced::color!(0x000000));
 
-        let hud = text(format!("cursor: {}/{}", self.cursor, self.char_count))
+        let hud = text(format!("cursor: {}/{}", self.cursor, total_chars))
             .size(14.0)
             .color(iced::color!(0x666666));
 
         column([text_widget.into(), hud.into()]).spacing(8).into()
     }
+
+    #[allow(dead_code)]
+    pub fn cached_lines(
+        &self,
+    ) -> &[Vec<Span<'static, (), iced::Font>>] {
+        &self.cached_lines
+    }
+}
+
+fn build_cache(
+    buffer: &Rope,
+) -> (
+    Vec<Span<'static, (), iced::Font>>,
+    Vec<Vec<Span<'static, (), iced::Font>>>,
+) {
+    let mut flat = Vec::new();
+    let mut lines = Vec::new();
+
+    for line_slice in buffer.lines() {
+        let span = Span::new(line_slice.to_string());
+        lines.push(vec![span.clone()]);
+        flat.push(span);
+    }
+
+    (flat, lines)
 }

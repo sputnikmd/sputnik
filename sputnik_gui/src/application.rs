@@ -1,11 +1,10 @@
-use std::sync::Arc;
-
 use iced::event::{self, Event};
 use iced::keyboard;
-use iced::keyboard::Key;
 use iced::keyboard::key::Named;
+use iced::keyboard::Key;
 use iced::widget::center;
 use iced::{Element, Subscription, Task};
+use ropey::Rope;
 
 use tracing::{debug, info};
 
@@ -13,12 +12,12 @@ use crate::APP_ICON;
 use crate::message::{self, Message};
 use crate::widgets::{Action, Editor};
 
-pub struct Application<'a> {
+pub struct Application {
     window_id: iced::window::Id,
-    editor: Editor<'a, Message>,
+    editor: Editor<Message>,
 }
 
-impl<'a> Application<'a> {
+impl Application {
     pub fn new() -> (Self, Task<Message>) {
         let icon = iced::window::icon::from_file_data(APP_ICON, None).ok();
         let settings = iced::window::Settings {
@@ -33,9 +32,9 @@ impl<'a> Application<'a> {
                 .map(|_| Message::Window(message::WindowMessage::InitializedMainWindow)),
         ];
 
-        let content = Arc::new(String::from(
-            "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua",
-        ));
+        let content = Rope::from_str(
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed \ndo eiusmod tempor incididunt ut labore et dolore magna aliqua",
+        );
 
         (
             Self {
@@ -66,6 +65,20 @@ impl<'a> Application<'a> {
                 }
                 Key::Named(Named::ArrowRight) => {
                     self.editor.action(Action::MoveCursorRight);
+                }
+                Key::Named(Named::Backspace) => {
+                    self.editor.action(Action::DeleteBackward);
+                }
+                Key::Named(Named::Delete) => {
+                    self.editor.action(Action::DeleteForward);
+                }
+                Key::Named(Named::Enter) => {
+                    self.editor.action(Action::Insert('\n'));
+                }
+                Key::Character(ch) => {
+                    for c in ch.chars() {
+                        self.editor.action(Action::Insert(c));
+                    }
                 }
                 _ => {}
             },

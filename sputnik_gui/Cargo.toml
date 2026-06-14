@@ -8,9 +8,15 @@ edition.workspace = true
 name = "sputnik"
 path = "src/main.rs"
 
+[dependencies]
+ropey = "1.6.1"
+
 [dependencies.iced]
 git = "https://github.com/iced-rs/iced.git"
 features = ["canvas", "advanced", "image"]
+
+[dependencies.cosmic-text]
+version = "0.19"
 
 [dependencies.anyhow]
 workspace = true
