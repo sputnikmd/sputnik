@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use iced::event::{self, Event};
 use iced::keyboard;
+use iced::keyboard::Key;
+use iced::keyboard::key::Named;
 use iced::widget::center;
 use iced::{Element, Subscription, Task};
 
@@ -9,7 +11,7 @@ use tracing::{debug, info};
 
 use crate::APP_ICON;
 use crate::message::{self, Message};
-use crate::widgets::Editor;
+use crate::widgets::{Action, Editor};
 
 pub struct Application<'a> {
     window_id: iced::window::Id,
@@ -58,7 +60,15 @@ impl<'a> Application<'a> {
                     return close_task;
                 }
             },
-            Message::KeyboardInput(_) => {}
+            Message::KeyboardInput(key) => match key {
+                Key::Named(Named::ArrowLeft) => {
+                    self.editor.action(Action::MoveCursorLeft);
+                }
+                Key::Named(Named::ArrowRight) => {
+                    self.editor.action(Action::MoveCursorRight);
+                }
+                _ => {}
+            },
 
             Message::None => {}
         }

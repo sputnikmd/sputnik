@@ -7,6 +7,11 @@ use iced::widget::{column, text};
 
 use crate::widgets::EditorParagraph;
 
+pub enum Action {
+    MoveCursorLeft,
+    MoveCursorRight,
+}
+
 pub struct Editor<'a, Message> {
     buffer: Arc<String>,
     span_cache: Vec<Span<'a, (), iced::Font>>,
@@ -23,6 +28,18 @@ impl<'a, Message: 'a> Editor<'a, Message> {
             span_cache: vec![span],
             cursor: 0,
             _phantom_data: PhantomData,
+        }
+    }
+
+    pub fn action(&mut self, action: Action) {
+        match action {
+            Action::MoveCursorLeft => {
+                self.cursor = self.cursor.saturating_sub(1);
+            }
+            Action::MoveCursorRight => {
+                let max = self.buffer.len();
+                self.cursor = (self.cursor + 1).min(max);
+            }
         }
     }
 
