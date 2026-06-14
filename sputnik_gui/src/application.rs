@@ -1,16 +1,22 @@
-use iced::widget::{center, text};
+use std::sync::Arc;
+
+use iced::event::{self, Event};
+use iced::keyboard;
+use iced::widget::center;
 use iced::{Element, Subscription, Task};
 
 use tracing::{debug, info};
 
 use crate::APP_ICON;
 use crate::message::{self, Message};
+use crate::widgets::Editor;
 
-pub struct Application {
+pub struct Application<'a> {
     window_id: iced::window::Id,
+    editor: Editor<'a, Message>,
 }
 
-impl Application {
+impl<'a> Application<'a> {
     pub fn new() -> (Self, Task<Message>) {
         let icon = iced::window::icon::from_file_data(APP_ICON, None).ok();
         let settings = iced::window::Settings {
@@ -25,9 +31,14 @@ impl Application {
                 .map(|_| Message::Window(message::WindowMessage::InitializedMainWindow)),
         ];
 
+        let content = Arc::new(String::from(
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua",
+        ));
+
         (
             Self {
                 window_id: main_window_id,
+                editor: Editor::new(content),
             },
             Task::batch(tasks),
         )
@@ -41,13 +52,14 @@ impl Application {
                 }
                 message::WindowMessage::Close(id) => {
                     let mut close_task = iced::window::close(id);
-                    // Close an entire application if we trying to close main window
                     if id == self.window_id {
                         close_task = close_task.chain(self.exit());
                     }
                     return close_task;
                 }
             },
+            Message::KeyboardInput(_) => {}
+
             Message::None => {}
         }
 
@@ -55,7 +67,7 @@ impl Application {
     }
 
     pub fn view(&self, _window_id: iced::window::Id) -> Element<'_, Message> {
-        center(text("Nothing here...")).into()
+        center(self.editor.to_element()).into()
     }
 
     pub fn title(&self, _window_id: iced::window::Id) -> String {
@@ -69,10 +81,17 @@ impl Application {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let tasks = vec![
+        let tasks: Vec<Subscription<Message>> = vec![
             iced::window::close_requests()
                 .map(|id| Message::Window(message::WindowMessage::Close(id))),
+            event::listen().map(|event| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
+                    Message::KeyboardInput(key)
+                }
+                _ => Message::None,
+            }),
         ];
+
         Subscription::batch(tasks)
     }
 }

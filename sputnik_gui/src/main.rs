@@ -2,6 +2,7 @@
 
 mod application;
 mod message;
+mod widgets;
 
 use crate::application::Application;
 
