@@ -1,7 +1,7 @@
 use iced::event::{self, Event};
 use iced::keyboard;
-use iced::keyboard::key::Named;
 use iced::keyboard::Key;
+use iced::keyboard::key::Named;
 use iced::widget::center;
 use iced::{Element, Subscription, Task};
 use ropey::Rope;
@@ -71,6 +71,12 @@ impl Application {
                 }
                 Key::Named(Named::Delete) => {
                     self.editor.action(Action::DeleteForward);
+                }
+                Key::Named(Named::Tab) => {
+                    self.editor.action(Action::InsertTab);
+                }
+                Key::Named(Named::Space) => {
+                    self.editor.action(Action::Insert(' '));
                 }
                 Key::Named(Named::Enter) => {
                     self.editor.action(Action::Insert('\n'));

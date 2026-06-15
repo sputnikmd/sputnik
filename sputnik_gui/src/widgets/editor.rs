@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
+use iced::Element;
 use iced::widget::text::Span;
 use iced::widget::{column, text};
-use iced::Element;
 use ropey::Rope;
 
 use crate::widgets::EditorParagraph;
@@ -11,6 +11,7 @@ pub enum Action {
     MoveCursorLeft,
     MoveCursorRight,
     Insert(char),
+    InsertTab,
     DeleteBackward,
     DeleteForward,
 }
@@ -22,6 +23,7 @@ pub struct Editor<Message> {
     #[allow(dead_code)]
     cached_lines: Vec<Vec<Span<'static, (), iced::Font>>>,
     _buffer_revision: usize,
+    tab_size: usize,
     _phantom_data: PhantomData<Message>,
 }
 
@@ -37,6 +39,7 @@ impl<Message> Editor<Message> {
             cached_flat,
             cached_lines,
             _buffer_revision: INITIAL_REVISION,
+            tab_size: 4,
             _phantom_data: PhantomData,
         }
     }
@@ -71,6 +74,12 @@ impl<Message> Editor<Message> {
                     self.edit(|rope| rope.remove(byte_start..byte_end));
                 }
             }
+            Action::InsertTab => {
+                let spaces: String = " ".repeat(self.tab_size);
+                let byte_pos = self.buffer.char_to_byte(self.cursor);
+                self.edit(|rope| rope.insert(byte_pos, spaces.as_str()));
+                self.cursor += self.tab_size;
+            }
         }
     }
 
@@ -94,17 +103,22 @@ impl<Message> Editor<Message> {
                 .size(24.0)
                 .cursor_color(iced::color!(0x000000));
 
-        let hud = text(format!("cursor: {}/{}", self.cursor, total_chars))
-            .size(14.0)
-            .color(iced::color!(0x666666));
+        let hud = text(format!(
+            "cursor: {}/{} tab_size: {}",
+            self.cursor, total_chars, self.tab_size
+        ))
+        .size(14.0)
+        .color(iced::color!(0x666666));
 
         column([text_widget.into(), hud.into()]).spacing(8).into()
     }
 
+    pub fn set_tab_size(&mut self, size: usize) {
+        self.tab_size = size;
+    }
+
     #[allow(dead_code)]
-    pub fn cached_lines(
-        &self,
-    ) -> &[Vec<Span<'static, (), iced::Font>>] {
+    pub fn cached_lines(&self) -> &[Vec<Span<'static, (), iced::Font>>] {
         &self.cached_lines
     }
 }
