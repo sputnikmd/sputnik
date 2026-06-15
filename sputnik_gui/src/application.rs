@@ -2,8 +2,8 @@ use iced::event::{self, Event};
 use iced::keyboard;
 use iced::keyboard::Key;
 use iced::keyboard::key::Named;
-use iced::widget::center;
-use iced::{Element, Subscription, Task};
+use iced::widget::{column, container, space, stack, text};
+use iced::{Element, Length, Subscription, Task};
 use ropey::Rope;
 
 use tracing::{debug, info};
@@ -96,7 +96,24 @@ impl Application {
     }
 
     pub fn view(&self, _window_id: iced::window::Id) -> Element<'_, Message> {
-        center(self.editor.to_element()).into()
+        let cursor = self.editor.cursor();
+        let total_chars = self.editor.total_chars();
+
+        let hud: Element<'_, Message> = text(format!("cursor: {}/{}", cursor, total_chars))
+            .size(14.0)
+            .color(iced::color!(0x666666))
+            .into();
+
+        container(
+            stack([
+                self.editor.view().into(),
+                column![space::vertical(), hud].into(),
+            ])
+            .width(Length::Fill)
+            .height(Length::Fill),
+        )
+        .padding(32.0)
+        .into()
     }
 
     pub fn title(&self, _window_id: iced::window::Id) -> String {

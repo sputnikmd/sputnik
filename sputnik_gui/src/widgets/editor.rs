@@ -2,7 +2,6 @@ use std::marker::PhantomData;
 
 use iced::Element;
 use iced::widget::text::Span;
-use iced::widget::{column, text};
 use ropey::Rope;
 
 use crate::widgets::EditorParagraph;
@@ -90,36 +89,37 @@ impl<Message> Editor<Message> {
         self.cursor = self.cursor.min(self.buffer.len_chars());
     }
 
-    fn cursor_byte_offset(&self) -> usize {
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn cursor_byte_offset(&self) -> usize {
         self.buffer.char_to_byte(self.cursor)
     }
 
-    pub fn to_element<'b>(&'b self) -> Element<'b, Message> {
-        let byte_cursor = self.cursor_byte_offset();
-        let total_chars = self.buffer.len_chars();
+    pub fn buffer(&self) -> &Rope {
+        &self.buffer
+    }
 
-        let text_widget =
-            EditorParagraph::with_spans(self.cached_flat.as_slice(), Some(byte_cursor))
-                .size(24.0)
-                .cursor_color(iced::color!(0x000000));
+    pub fn total_chars(&self) -> usize {
+        self.buffer.len_chars()
+    }
 
-        let hud = text(format!(
-            "cursor: {}/{} tab_size: {}",
-            self.cursor, total_chars, self.tab_size
-        ))
-        .size(14.0)
-        .color(iced::color!(0x666666));
-
-        column([text_widget.into(), hud.into()]).spacing(8).into()
+    pub fn tab_size(&self) -> usize {
+        self.tab_size
     }
 
     pub fn set_tab_size(&mut self, size: usize) {
         self.tab_size = size;
     }
 
-    #[allow(dead_code)]
-    pub fn cached_lines(&self) -> &[Vec<Span<'static, (), iced::Font>>] {
-        &self.cached_lines
+    pub fn view<'b>(&'b self) -> Element<'b, Message> {
+        let byte_cursor = self.cursor_byte_offset();
+
+        EditorParagraph::with_spans(self.cached_flat.as_slice(), Some(byte_cursor))
+            .size(24.0)
+            .cursor_color(iced::color!(0x000000))
+            .into()
     }
 }
 
