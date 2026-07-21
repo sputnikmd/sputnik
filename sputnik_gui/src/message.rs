@@ -3,7 +3,10 @@ use iced::keyboard::Key;
 #[derive(Debug, Clone)]
 pub enum Message {
     Window(WindowMessage),
-    KeyboardInput(Key),
+    KeyboardInput {
+        key: Key,
+        text: Option<smol_str::SmolStr>,
+    },
     None,
 }
 

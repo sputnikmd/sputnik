@@ -39,7 +39,7 @@ impl Application {
         (
             Self {
                 window_id: main_window_id,
-                editor: Editor::new(content),
+                editor: Editor::<Message>::new(content),
             },
             Task::batch(tasks),
         )
@@ -59,12 +59,18 @@ impl Application {
                     return close_task;
                 }
             },
-            Message::KeyboardInput(key) => match key {
+            Message::KeyboardInput { key, text } => match key {
                 Key::Named(Named::ArrowLeft) => {
                     self.editor.action(Action::MoveCursorLeft);
                 }
                 Key::Named(Named::ArrowRight) => {
                     self.editor.action(Action::MoveCursorRight);
+                }
+                Key::Named(Named::ArrowUp) => {
+                    self.editor.action(Action::MoveCursorUp);
+                }
+                Key::Named(Named::ArrowDown) => {
+                    self.editor.action(Action::MoveCursorDown);
                 }
                 Key::Named(Named::Backspace) => {
                     self.editor.action(Action::DeleteBackward);
@@ -81,12 +87,14 @@ impl Application {
                 Key::Named(Named::Enter) => {
                     self.editor.action(Action::Insert('\n'));
                 }
-                Key::Character(ch) => {
-                    for c in ch.chars() {
-                        self.editor.action(Action::Insert(c));
+
+                _ => {
+                    if let Some(txt) = text {
+                        for c in txt.chars() {
+                            self.editor.action(Action::Insert(c));
+                        }
                     }
                 }
-                _ => {}
             },
 
             Message::None => {}
@@ -96,13 +104,14 @@ impl Application {
     }
 
     pub fn view(&self, _window_id: iced::window::Id) -> Element<'_, Message> {
-        let cursor = self.editor.cursor();
-        let total_chars = self.editor.total_chars();
-
-        let hud: Element<'_, Message> = text(format!("cursor: {}/{}", cursor, total_chars))
-            .size(14.0)
-            .color(iced::color!(0x666666))
-            .into();
+        let hud: Element<'_, Message> = text(format!(
+            "cursor: {}/{}",
+            self.editor.cursor(),
+            self.editor.total_chars(),
+        ))
+        .size(14.0)
+        .color(iced::color!(0x666666))
+        .into();
 
         container(
             stack([
@@ -131,8 +140,8 @@ impl Application {
             iced::window::close_requests()
                 .map(|id| Message::Window(message::WindowMessage::Close(id))),
             event::listen().map(|event| match event {
-                Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
-                    Message::KeyboardInput(key)
+                Event::Keyboard(keyboard::Event::KeyPressed { key, text, .. }) => {
+                    Message::KeyboardInput { key, text }
                 }
                 _ => Message::None,
             }),
