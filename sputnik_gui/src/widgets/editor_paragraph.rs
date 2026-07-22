@@ -47,6 +47,11 @@ where
     /// what's already visible are ever shaped — while `offset` still gives
     /// smooth, pixel-precise scrolling within that.
     scroll_anchor: &'a Cell<(usize, f32)>,
+    /// The document's char-index cursor cell. Written directly by `update()`
+    /// on a left click — the same interior-mutability route `scroll_anchor`
+    /// uses, since this widget only ever gets `&self` access to the
+    /// `Editor` that owns it.
+    cursor_cell: &'a Cell<usize>,
     /// Set by `update()` when a wheel event is processed. `layout()` reads
     /// it to decide whether the scroll was user-initiated (wheel) vs
     /// cursor-initiated (keyboard): only in the latter case should
@@ -102,6 +107,7 @@ where
         cursor: Option<usize>,
         nav_width: &'a Cell<f32>,
         scroll_anchor: &'a Cell<(usize, f32)>,
+        cursor_cell: &'a Cell<usize>,
     ) -> Self {
         Self {
             buffer,
@@ -120,6 +126,7 @@ where
             cursor_width: 2.0,
             nav_width,
             scroll_anchor,
+            cursor_cell,
             wheel_scrolled: false,
             class: Theme::default(),
         }
@@ -636,6 +643,11 @@ where
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
+        if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
+            click_to_cursor::<Message, Theme, Renderer>(self, tree, layout, cursor, shell);
+            return;
+        }
+
         let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event else {
             return;
         };
@@ -1065,6 +1077,82 @@ fn cursor_pos_in_row(
     Some((0.0, 0.0, lh))
 }
 
+/// Moves the cursor to wherever the user just left-clicked, hit-testing
+/// against the rows the last `layout()` pass already shaped (from
+/// `tree.state`) rather than reshaping anything. Writes straight into
+/// `cursor_cell` — the same interior-mutability route `scroll_anchor` uses,
+/// since the widget only ever gets `&self` access to the `Editor` that owns
+/// it — so this only needs `&EditorParagraph`, not `&mut`.
+fn click_to_cursor<Message, Theme, Renderer>(
+    widget: &EditorParagraph<'_, Theme, Renderer>,
+    tree: &mut Tree,
+    layout: Layout<'_>,
+    cursor: mouse::Cursor,
+    shell: &mut Shell<'_, Message>,
+) where
+    Renderer: text_advanced::Renderer + 'static,
+    Renderer::Paragraph: Clone,
+    Theme: Catalog,
+{
+    let Some(point) = cursor.position_over(layout.bounds()) else {
+        return;
+    };
+
+    let bounds = layout.bounds();
+    let anchor = bounds.anchor(bounds.size(), widget.align_x, widget.align_y);
+    let gutter = if widget.show_line_numbers {
+        gutter_width()
+    } else {
+        0.0
+    };
+    let text_anchor = Point::new(anchor.x + gutter, anchor.y);
+
+    let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
+    if let Some(byte) = hit_test::<Renderer>(&state.rows, text_anchor, point) {
+        let char_idx = widget
+            .buffer
+            .byte_to_char(byte.min(widget.buffer.len_bytes()));
+        if char_idx != widget.cursor_cell.get() {
+            widget.cursor_cell.set(char_idx);
+            shell.invalidate_layout();
+            shell.request_redraw();
+        }
+    }
+
+    shell.capture_event();
+}
+
+/// Finds the byte offset nearest `point` (in the same coordinate space as
+/// `draw`'s `text_anchor`) by hit-testing the rows already shaped for
+/// rendering. A click above the first row or below the last snaps to that
+/// row's nearest edge instead of being ignored.
+fn hit_test<Renderer: text_advanced::Renderer>(
+    rows: &[Row<Renderer::Paragraph>],
+    anchor: Point,
+    point: Point,
+) -> Option<usize> {
+    let local_y = point.y - anchor.y;
+
+    let row = rows
+        .iter()
+        .rev()
+        .find(|row| local_y >= row.y)
+        .or_else(|| rows.first())?;
+
+    let hint = Paragraph::hint_factor(&row.paragraph).unwrap_or(1.0);
+    let any: &dyn Any = &row.paragraph as &dyn Any;
+    let gp = any.downcast_ref::<GraphicsParagraph>()?;
+
+    // `row.y`/`local_y` are in screen (unhinted) space, but the cosmic-text
+    // buffer's own coordinates are hinted — the same reason `cursor_pos_in_row`
+    // divides by `hint` to go the other way.
+    let buffer_x = (point.x - anchor.x) * hint;
+    let buffer_y = (local_y - row.y) * hint;
+    let cosmic_cursor = gp.buffer().hit(buffer_x, buffer_y)?;
+
+    Some(row.source_start + cosmic_cursor.index.min(row.text_len))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,9 +1172,10 @@ mod tests {
         let buffer = Rope::from_str(&text);
         let nav_width = Cell::new(800.0);
         let scroll_anchor = Cell::new((0usize, 0.0f32));
+        let cursor_cell = Cell::new(0usize);
 
         let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
-            EditorParagraph::new(&buffer, None, &nav_width, &scroll_anchor)
+            EditorParagraph::new(&buffer, None, &nav_width, &scroll_anchor, &cursor_cell)
                 .size(24.0)
                 .into();
 
@@ -1131,9 +1220,10 @@ mod tests {
         let buffer = Rope::from_str(&text);
         let nav_width = Cell::new(800.0);
         let scroll_anchor = Cell::new((0usize, 0.0f32));
+        let cursor_cell = Cell::new(0usize);
 
         let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
-            EditorParagraph::new(&buffer, None, &nav_width, &scroll_anchor)
+            EditorParagraph::new(&buffer, None, &nav_width, &scroll_anchor, &cursor_cell)
                 .size(24.0)
                 .into();
 
@@ -1198,9 +1288,10 @@ mod tests {
         let buffer = Rope::from_str(&text);
         let nav_width = Cell::new(100.0);
         let scroll_anchor = Cell::new((0usize, 0.0f32));
+        let cursor_cell = Cell::new(0usize);
 
         let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
-            EditorParagraph::new(&buffer, None, &nav_width, &scroll_anchor)
+            EditorParagraph::new(&buffer, None, &nav_width, &scroll_anchor, &cursor_cell)
                 .size(24.0)
                 .into();
 

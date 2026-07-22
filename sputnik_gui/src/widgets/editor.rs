@@ -29,7 +29,10 @@ fn clamp_selection(start: usize, end: usize, len: usize) -> Option<Range<usize>>
 
 pub struct Editor<Message> {
     buffer: Rope,
-    cursor: usize,
+    /// Interior mutability so a mouse click — handled inside the widget,
+    /// which only ever gets `&self` via `view()` — can move the cursor
+    /// directly, the same way `nav_width` and `scroll_anchor` are updated.
+    cursor: Cell<usize>,
     tab_size: usize,
     /// Wrapping width for visual navigation. Interior mutability so callers
     /// with only `&self` can update it after layout.
@@ -48,7 +51,7 @@ impl<Message> Editor<Message> {
     pub fn new(buffer: Rope) -> Editor<Message> {
         Editor {
             buffer,
-            cursor: 0,
+            cursor: Cell::new(0),
             tab_size: 4,
             nav_width: Cell::new(800.0),
             scroll_anchor: Cell::new((0, 0.0)),
@@ -60,46 +63,47 @@ impl<Message> Editor<Message> {
     pub fn action(&mut self, action: Action) {
         match action {
             Action::MoveCursorLeft => {
-                self.cursor = self.cursor.saturating_sub(1);
+                self.cursor.set(self.cursor.get().saturating_sub(1));
             }
             Action::MoveCursorRight => {
-                self.cursor = (self.cursor + 1).min(self.buffer.len_chars());
+                self.cursor
+                    .set((self.cursor.get() + 1).min(self.buffer.len_chars()));
             }
             Action::MoveCursorUp => {
-                self.cursor = self.navigate_visual(-1);
+                self.cursor.set(self.navigate_visual(-1));
             }
             Action::MoveCursorDown => {
-                self.cursor = self.navigate_visual(1);
+                self.cursor.set(self.navigate_visual(1));
             }
             Action::Insert(ch) => {
-                let idx = self.cursor;
+                let idx = self.cursor.get();
                 self.edit(|rope| rope.insert(idx, ch.encode_utf8(&mut [0; 4])));
-                self.cursor += 1;
+                self.cursor.set(idx + 1);
             }
             Action::DeleteBackward => {
-                if self.cursor > 0 {
-                    let idx = self.cursor;
+                let idx = self.cursor.get();
+                if idx > 0 {
                     self.edit(|rope| rope.remove((idx - 1)..idx));
-                    self.cursor = idx - 1;
+                    self.cursor.set(idx - 1);
                 }
             }
             Action::DeleteForward => {
-                if self.cursor < self.buffer.len_chars() {
-                    let idx = self.cursor;
+                let idx = self.cursor.get();
+                if idx < self.buffer.len_chars() {
                     self.edit(|rope| rope.remove(idx..(idx + 1)));
                 }
             }
             Action::InsertTab => {
-                let idx = self.cursor;
+                let idx = self.cursor.get();
                 let spaces = " ".repeat(self.tab_size);
                 self.edit(|rope| rope.insert(idx, &spaces));
-                self.cursor += self.tab_size;
+                self.cursor.set(idx + self.tab_size);
             }
         }
     }
 
     fn flat_cursor(&self) -> usize {
-        self.buffer.char_to_byte(self.cursor)
+        self.buffer.char_to_byte(self.cursor.get())
     }
 
     fn navigate_visual(&self, direction: isize) -> usize {
@@ -107,7 +111,7 @@ impl<Message> Editor<Message> {
         let flat_cursor = self.flat_cursor();
 
         // Determine which logical lines we need to shape for navigation.
-        let cursor_line = self.buffer.char_to_line(self.cursor);
+        let cursor_line = self.buffer.char_to_line(self.cursor.get());
         let n_lines = self.buffer.len_lines();
 
         let (seg_start, seg_end) = if direction < 0 {
@@ -133,7 +137,7 @@ impl<Message> Editor<Message> {
         let seg_bytes_before = self.buffer.char_to_byte(seg_char_start);
 
         if seg_slice.len_bytes() == 0 {
-            return self.cursor;
+            return self.cursor.get();
         }
 
         // Flatten the segment into a contiguous string (only the relevant lines).
@@ -196,7 +200,7 @@ impl<Message> Editor<Message> {
         vlines.sort_by_key(|vl| vl.local_start);
 
         if vlines.is_empty() {
-            return self.cursor;
+            return self.cursor.get();
         }
 
         let seg_flat_cursor = flat_cursor.saturating_sub(seg_bytes_before);
@@ -263,7 +267,7 @@ impl<Message> Editor<Message> {
     pub fn edit(&mut self, f: impl FnOnce(&mut Rope)) {
         f(&mut self.buffer);
         let len = self.buffer.len_chars();
-        self.cursor = self.cursor.min(len);
+        self.cursor.set(self.cursor.get().min(len));
         // An edit can shrink the buffer out from under a selection set
         // before it (e.g. deleting past what was selected): re-clamp rather
         // than let it go stale and panic on the next `char_to_byte`.
@@ -274,7 +278,7 @@ impl<Message> Editor<Message> {
     }
 
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.cursor.get()
     }
 
     pub fn total_chars(&self) -> usize {
@@ -325,6 +329,7 @@ impl<Message> Editor<Message> {
             Some(self.flat_cursor()),
             &self.nav_width,
             &self.scroll_anchor,
+            &self.cursor,
         )
         .size(FONT_SIZE)
         .show_line_numbers(true)
@@ -546,6 +551,64 @@ mod tests {
         assert!(scrolled_matches, "scrolled rendering drifted");
     }
 
+    /// Clicking inside the editor should move the text cursor to the
+    /// clicked position, not just the (separate) mouse cursor.
+    #[test]
+    fn click_moves_cursor_to_clicked_position() {
+        let mut editor = Editor::<()>::new(Rope::from_str(""));
+        let text = "hello\nworld\n";
+        for ch in text.chars() {
+            editor.action(Action::Insert(ch));
+        }
+        for _ in 0..text.chars().count() {
+            editor.action(Action::MoveCursorLeft);
+        }
+        assert_eq!(editor.cursor(), 0, "cursor should start at the beginning");
+
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(300.0, 200.0),
+            element,
+        );
+        // Force an initial layout so the widget has shaped rows to
+        // hit-test against.
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        // "hello" is the first (0th) row, roughly one line-height tall;
+        // clicking well into the second row's vertical band should land the
+        // cursor somewhere on the "world" line, not on "hello".
+        ui.point_at(iced_test::core::Point::new(250.0, 45.0));
+        ui.simulate([
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )),
+        ]);
+
+        let cursor = editor.cursor();
+        assert_ne!(
+            cursor, 0,
+            "click should have moved the cursor off its starting position"
+        );
+
+        let cursor_line = editor.buffer.char_to_line(cursor);
+        assert_eq!(
+            cursor_line, 1,
+            "clicking on the second row should place the cursor on line 1 (\"world\")"
+        );
+
+        // The click's x (250px) is far past "world"'s rendered width at
+        // this font size, so hit-testing should clamp to the end of the
+        // line rather than leaving the cursor short of it.
+        let line_start = editor.buffer.line_to_char(1);
+        assert_eq!(
+            cursor - line_start,
+            "world".len(),
+            "a click past the end of a short line should clamp to that line's end"
+        );
+    }
+
     /// Regression test: navigating up through an empty line should not
     /// cause the cursor to go back down after a couple of moves.
     #[test]
@@ -557,7 +620,7 @@ mod tests {
         let mut positions = Vec::new();
         for _ in 0..n_chars {
             editor.action(Action::MoveCursorUp);
-            positions.push(editor.cursor);
+            positions.push(editor.cursor.get());
         }
 
         let zero_pos = positions.iter().position(|&p| p == 0).unwrap_or(usize::MAX);
@@ -596,7 +659,7 @@ mod tests {
         let mut positions = Vec::new();
         for _ in 0..text.chars().count() {
             editor.action(Action::MoveCursorUp);
-            positions.push(editor.cursor);
+            positions.push(editor.cursor.get());
         }
 
         for w in positions.windows(2) {
