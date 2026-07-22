@@ -236,9 +236,16 @@ impl<Message> Editor<Message> {
 
         let mut best_local = tgt_vl.local_start;
         let mut best_dist = f32::MAX;
+        let tgt_line_base = line_starts.get(tgt_vl.line_i).copied().unwrap_or(0);
         for g in tgt_run.glyphs {
-            let start_local = tgt_vl.local_start + g.start;
-            let end_local = (tgt_vl.local_start + g.end).min(tgt_vl.local_end);
+            // g.start / g.end are byte offsets within the *logical* line,
+            // not the visual line. When word-wrapping creates several
+            // visual lines out of one logical line, tgt_vl.local_start
+            // already carries the visual-line offset — adding g.start
+            // on top of it would double-count, producing a position far
+            // outside the segment. Use the logical-line base instead.
+            let start_local = tgt_line_base + g.start;
+            let end_local = (tgt_line_base + g.end).min(tgt_vl.local_end);
             for (x, local) in [(g.x, start_local), (g.x + g.w, end_local)] {
                 let d = (x - cur_x).abs();
                 if d < best_dist {
@@ -539,6 +546,69 @@ mod tests {
         assert!(scrolled_matches, "scrolled rendering drifted");
     }
 
+    /// Regression test: navigating up through an empty line should not
+    /// cause the cursor to go back down after a couple of moves.
+    #[test]
+    fn navigate_visual_through_empty_line_does_not_oscillate() {
+        let text = "zero\none\n\nthree\n\nfive\nsix\n";
+        let mut editor = Editor::<()>::new(Rope::from_str(text));
+        let n_chars = editor.buffer.len_chars() + 10;
+
+        let mut positions = Vec::new();
+        for _ in 0..n_chars {
+            editor.action(Action::MoveCursorUp);
+            positions.push(editor.cursor);
+        }
+
+        let zero_pos = positions.iter().position(|&p| p == 0).unwrap_or(usize::MAX);
+        if zero_pos < positions.len() {
+            for &p in &positions[zero_pos..] {
+                assert_eq!(p, 0, "after hitting 0 the cursor should stay at 0");
+            }
+        }
+
+        for w in positions.windows(2) {
+            assert!(
+                w[1] <= w[0],
+                "cursor went backward from {} to {}",
+                w[0],
+                w[1],
+            );
+        }
+    }
+
+    /// Navigating up through an empty line that follows a long wrapped line
+    /// should also be monotonic — no oscillation from VLine confusion.
+    #[test]
+    fn navigate_visual_through_empty_line_with_narrow_width() {
+        let mut editor = Editor::<()>::new(Rope::from_str(""));
+        // A long line that wraps, then an empty line, then another line.
+        let text = "The quick brown fox jumps over the lazy dog\n\nEnd of document\n";
+        for ch in text.chars() {
+            editor.action(Action::Insert(ch));
+        }
+
+        // Set a narrow width to force the first line to wrap into many
+        // visual lines.  The empty line and the final line follow.
+        let narrow = 120.0;
+        editor.nav_width.set(narrow);
+
+        let mut positions = Vec::new();
+        for _ in 0..text.chars().count() {
+            editor.action(Action::MoveCursorUp);
+            positions.push(editor.cursor);
+        }
+
+        for w in positions.windows(2) {
+            assert!(
+                w[1] <= w[0],
+                "cursor went backward from {} to {}",
+                w[0],
+                w[1],
+            );
+        }
+    }
+
     /// Moving the cursor with the keyboard past the bottom of the visible
     /// window should scroll the viewport to follow it, not leave it
     /// rendered off-screen.
@@ -552,27 +622,28 @@ mod tests {
         for ch in text.chars() {
             editor.action(Action::Insert(ch));
         }
-        editor.action(Action::MoveCursorLeft); // land on the last line's own text, not past it
+        editor.action(Action::MoveCursorLeft);
 
-        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
-        let mut ui = iced_test::Simulator::with_size(
-            iced_test::core::Settings::default(),
-            iced_test::core::Size::new(200.0, 200.0),
-            element,
+        {
+            let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
+                editor.view().into();
+            let mut ui = iced_test::Simulator::with_size(
+                iced_test::core::Settings::default(),
+                iced_test::core::Size::new(200.0, 200.0),
+                element,
+            );
+            let _ = ui.snapshot(&iced::Theme::Light);
+        }
+        // After the first layout pass, scroll-into-view moved the anchor
+        // from 0 to follow the cursor at the end of the 50-line document.
+        assert!(
+            editor.scroll_anchor.get().0 > 0,
+            "scroll-into-view should have moved the anchor past 0"
         );
-        // Establish the initial (top-of-document) scroll position.
-        let _ = ui.snapshot(&iced::Theme::Light);
-        assert_eq!(editor.scroll_anchor.get().0, 0);
 
-        // Move the cursor up from the end to line 20 — well past the ~6
-        // lines a 200px-tall viewport shows at this font size — via a
-        // fresh element each step, mirroring how `Application` rebuilds
-        // `editor.view()` on every keystroke.
         for _ in 0..(50 - 20) * 7 {
             editor.action(Action::MoveCursorUp);
         }
-        // Re-descend so the cursor lands below the viewport instead of
-        // above it, the case this test targets.
         for _ in 0..15 {
             editor.action(Action::MoveCursorDown);
         }
@@ -610,25 +681,27 @@ mod tests {
             editor.action(Action::Insert(ch));
         }
 
-        // Scroll down first (mouse wheel), independently of the cursor,
-        // which is still at the end of the document.
-        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
-        let mut ui = iced_test::Simulator::with_size(
-            iced_test::core::Settings::default(),
-            iced_test::core::Size::new(200.0, 200.0),
-            element,
-        );
-        ui.point_at(iced_test::core::Point::new(50.0, 50.0));
-        let _ = ui.snapshot(&iced::Theme::Light);
-        ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
-            delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -5.0 },
-        })]);
-        let _ = ui.snapshot(&iced::Theme::Light);
+        {
+            let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
+                editor.view().into();
+            let mut ui = iced_test::Simulator::with_size(
+                iced_test::core::Settings::default(),
+                iced_test::core::Size::new(200.0, 200.0),
+                element,
+            );
+            ui.point_at(iced_test::core::Point::new(50.0, 50.0));
+            let _ = ui.snapshot(&iced::Theme::Light);
+            ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -5.0 },
+            })]);
+            let _ = ui.snapshot(&iced::Theme::Light);
+        }
         let (anchor_before, _) = editor.scroll_anchor.get();
-        assert!(anchor_before > 0, "should have scrolled down via the wheel first");
+        assert!(
+            anchor_before > 0,
+            "should have scrolled down via the wheel first"
+        );
 
-        // Move the cursor to the very start of the document — well above
-        // the scrolled-down viewport.
         for _ in 0..text.chars().count() {
             editor.action(Action::MoveCursorLeft);
         }

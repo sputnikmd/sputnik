@@ -47,6 +47,11 @@ where
     /// what's already visible are ever shaped — while `offset` still gives
     /// smooth, pixel-precise scrolling within that.
     scroll_anchor: &'a Cell<(usize, f32)>,
+    /// Set by `update()` when a wheel event is processed. `layout()` reads
+    /// it to decide whether the scroll was user-initiated (wheel) vs
+    /// cursor-initiated (keyboard): only in the latter case should
+    /// scroll-into-view override the anchor.
+    wheel_scrolled: bool,
     class: Theme::Class<'a>,
 }
 
@@ -106,6 +111,7 @@ where
             cursor_width: 2.0,
             nav_width,
             scroll_anchor,
+            wheel_scrolled: false,
             class: Theme::default(),
         }
     }
@@ -430,33 +436,37 @@ where
             let previous = std::mem::take(&mut state.rows);
             let (mut new_rows, mut width) = shape_window(anchor_line, anchor_offset, &previous);
 
-            // Scroll into view: if a keyboard action (typing, arrow keys)
-            // moved the cursor outside the window just rendered, move the
-            // anchor to bring its line back into view and reshape. Cheap
-            // in the common case where the cursor stayed on-screen — this
-            // only adds a second shaping pass when it didn't, and that pass
-            // reuses `new_rows`'s paragraphs by content wherever the two
-            // windows overlap.
-            if let Some(cursor) = self.cursor {
-                let cursor_line = self
-                    .buffer
-                    .byte_to_line(cursor.min(self.buffer.len_bytes()));
+            // Scroll into view: only when the scroll was NOT user-initiated
+            // (mouse wheel). A wheel event already set the anchor exactly
+            // where the user wants it; overriding it here would fight the
+            // wheel and make scrolling impossible when the cursor is at a
+            // different position in the document.
+            if !self.wheel_scrolled {
+                if let Some(cursor) = self.cursor {
+                    let cursor_line = self
+                        .buffer
+                        .byte_to_line(cursor.min(self.buffer.len_bytes()));
 
-                if cursor_line < anchor_line {
-                    anchor_line = cursor_line;
-                    anchor_offset = 0.0;
-                    (new_rows, width) = shape_window(anchor_line, anchor_offset, &new_rows);
-                } else if cursor_line >= anchor_line + new_rows.len() {
-                    // Bring the cursor's line to the bottom of the window
-                    // rather than snapping it to the top: a minimal scroll,
-                    // not an overshoot.
-                    anchor_line = cursor_line.saturating_sub(new_rows.len().saturating_sub(1));
-                    anchor_offset = 0.0;
-                    (new_rows, width) = shape_window(anchor_line, anchor_offset, &new_rows);
+                    if cursor_line < anchor_line {
+                        anchor_line = cursor_line;
+                        anchor_offset = 0.0;
+                        (new_rows, width) =
+                            shape_window(anchor_line, anchor_offset, &new_rows);
+                    } else if cursor_line >= anchor_line + new_rows.len() {
+                        // Bring the cursor's line to the bottom of the window
+                        // rather than snapping it to the top: a minimal scroll,
+                        // not an overshoot.
+                        anchor_line = cursor_line
+                            .saturating_sub(new_rows.len().saturating_sub(1));
+                        anchor_offset = 0.0;
+                        (new_rows, width) =
+                            shape_window(anchor_line, anchor_offset, &new_rows);
+                    }
+
+                    self.scroll_anchor.set((anchor_line, anchor_offset));
                 }
-
-                self.scroll_anchor.set((anchor_line, anchor_offset));
             }
+            self.wheel_scrolled = false;
 
             let _ = width;
             state.rows = new_rows;
@@ -507,6 +517,8 @@ where
             mouse::ScrollDelta::Lines { y, .. } => -y * line_height_px * 3.0,
             mouse::ScrollDelta::Pixels { y, .. } => -y,
         };
+
+        self.wheel_scrolled = true;
 
         if delta_px != 0.0 {
             let n_lines = self.buffer.len_lines();
