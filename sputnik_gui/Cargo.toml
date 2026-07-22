@@ -9,6 +9,7 @@ name = "sputnik"
 path = "src/main.rs"
 
 [dependencies]
+rfd = "0.17.2"
 ropey = "1.6.1"
 smol_str = "0.2"
 

@@ -28,6 +28,13 @@ async fn load_file(path: PathBuf) -> Result<Arc<String>, (PathBuf, io::ErrorKind
         .map_err(|err| (path, err.kind()))
 }
 
+async fn pick_file() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .pick_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
 impl Application {
     pub fn new(file: Option<PathBuf>) -> (Self, Task<Message>) {
         let icon = iced::window::icon::from_file_data(APP_ICON, None).ok();
@@ -107,6 +114,13 @@ impl Application {
                 }
             },
 
+            Message::RequestOpenFile => {
+                return Task::perform(pick_file(), |path| match path {
+                    Some(path) => Message::OpenFile(path),
+                    None => Message::None,
+                });
+            }
+
             Message::OpenFile(path) => {
                 return Task::perform(load_file(path), Message::FileOpened);
             }
@@ -165,9 +179,15 @@ impl Application {
             iced::window::close_requests()
                 .map(|id| Message::Window(message::WindowMessage::Close(id))),
             event::listen().map(|event| match event {
-                Event::Keyboard(keyboard::Event::KeyPressed { key, text, .. }) => {
-                    Message::KeyboardInput { key, text }
-                }
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key,
+                    modifiers,
+                    text,
+                    ..
+                }) => match key.as_ref() {
+                    Key::Character("o") if modifiers.command() => Message::RequestOpenFile,
+                    _ => Message::KeyboardInput { key, text },
+                },
                 _ => Message::None,
             }),
         ];
