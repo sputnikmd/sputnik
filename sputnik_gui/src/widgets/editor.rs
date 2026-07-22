@@ -538,4 +538,113 @@ mod tests {
             .expect("snapshot should save");
         assert!(scrolled_matches, "scrolled rendering drifted");
     }
+
+    /// Moving the cursor with the keyboard past the bottom of the visible
+    /// window should scroll the viewport to follow it, not leave it
+    /// rendered off-screen.
+    #[test]
+    fn cursor_movement_scrolls_viewport_into_view_below() {
+        let mut editor = Editor::<()>::new(Rope::from_str(""));
+        let mut text = String::new();
+        for i in 1..=50 {
+            text.push_str(&format!("line {i}\n"));
+        }
+        for ch in text.chars() {
+            editor.action(Action::Insert(ch));
+        }
+        editor.action(Action::MoveCursorLeft); // land on the last line's own text, not past it
+
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(200.0, 200.0),
+            element,
+        );
+        // Establish the initial (top-of-document) scroll position.
+        let _ = ui.snapshot(&iced::Theme::Light);
+        assert_eq!(editor.scroll_anchor.get().0, 0);
+
+        // Move the cursor up from the end to line 20 — well past the ~6
+        // lines a 200px-tall viewport shows at this font size — via a
+        // fresh element each step, mirroring how `Application` rebuilds
+        // `editor.view()` on every keystroke.
+        for _ in 0..(50 - 20) * 7 {
+            editor.action(Action::MoveCursorUp);
+        }
+        // Re-descend so the cursor lands below the viewport instead of
+        // above it, the case this test targets.
+        for _ in 0..15 {
+            editor.action(Action::MoveCursorDown);
+        }
+        let cursor_line = editor.buffer.byte_to_line(editor.flat_cursor());
+
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(200.0, 200.0),
+            element,
+        );
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        let (anchor_line, _) = editor.scroll_anchor.get();
+        assert!(
+            cursor_line >= anchor_line,
+            "cursor line {cursor_line} should be at or below the new anchor {anchor_line}"
+        );
+        assert!(
+            anchor_line > 0,
+            "viewport should have scrolled down to follow the cursor, stayed at {anchor_line}"
+        );
+    }
+
+    /// Moving the cursor with the keyboard past the top of the visible
+    /// window should scroll the viewport back up to follow it.
+    #[test]
+    fn cursor_movement_scrolls_viewport_into_view_above() {
+        let mut editor = Editor::<()>::new(Rope::from_str(""));
+        let mut text = String::new();
+        for i in 1..=50 {
+            text.push_str(&format!("line {i}\n"));
+        }
+        for ch in text.chars() {
+            editor.action(Action::Insert(ch));
+        }
+
+        // Scroll down first (mouse wheel), independently of the cursor,
+        // which is still at the end of the document.
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(200.0, 200.0),
+            element,
+        );
+        ui.point_at(iced_test::core::Point::new(50.0, 50.0));
+        let _ = ui.snapshot(&iced::Theme::Light);
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -5.0 },
+        })]);
+        let _ = ui.snapshot(&iced::Theme::Light);
+        let (anchor_before, _) = editor.scroll_anchor.get();
+        assert!(anchor_before > 0, "should have scrolled down via the wheel first");
+
+        // Move the cursor to the very start of the document — well above
+        // the scrolled-down viewport.
+        for _ in 0..text.chars().count() {
+            editor.action(Action::MoveCursorLeft);
+        }
+
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(200.0, 200.0),
+            element,
+        );
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        assert_eq!(
+            editor.scroll_anchor.get(),
+            (0, 0.0),
+            "viewport should have scrolled back up to reveal the cursor at the start"
+        );
+    }
 }

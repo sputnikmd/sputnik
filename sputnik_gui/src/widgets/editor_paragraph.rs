@@ -304,11 +304,15 @@ where
             };
 
             // Clamp the anchor: the buffer may have shrunk (deletions) since
-            // the last scroll.
+            // the last scroll. Once the anchor is the last line, force its
+            // offset to 0 too — otherwise the last line could be scrolled
+            // up past the top of the viewport, opening a gap of blank
+            // space below it with nothing left to scroll into. The last
+            // line should stop flush at the top instead.
             let n_lines = self.buffer.len_lines();
             let (mut anchor_line, mut anchor_offset) = self.scroll_anchor.get();
             anchor_line = anchor_line.min(n_lines.saturating_sub(1));
-            if n_lines == 0 {
+            if n_lines == 0 || anchor_line + 1 >= n_lines {
                 anchor_offset = 0.0;
             }
             self.scroll_anchor.set((anchor_line, anchor_offset));
@@ -318,85 +322,143 @@ where
             // is always a sufficient (if sometimes generous) slice.
             let line_height_px = f32::from(self.line_height.to_absolute(size)).max(1.0);
             let max_visible_lines = ((para_bounds.height / line_height_px).ceil() as usize).max(1);
-            let windowed =
-                window_rows::<Renderer::Font>(self.buffer, anchor_line, max_visible_lines + 2);
 
-            // Index the previous frame's shaped rows by their text, so an
-            // unchanged line reuses its paragraph (cheap Arc clone) instead
-            // of being reshaped. Indexed by content, not position: inserting
-            // or deleting a line shifts indices but not surviving rows' text.
-            // Rows that scrolled offscreen are simply never looked up again
-            // and drop here, which is exactly the eviction we want.
-            let previous = std::mem::take(&mut state.rows);
-            let mut by_key: HashMap<&str, usize> = HashMap::with_capacity(previous.len());
-            for (i, row) in previous.iter().enumerate() {
-                if let Some(text) = shaped_text(&row.paragraph) {
-                    by_key.entry(text).or_insert(i);
-                }
-            }
+            // Shapes the visible window for a given anchor, reusing
+            // `previous`'s paragraphs by content where possible. Called
+            // once normally, and a second time if scroll-into-view (below)
+            // has to move the anchor — content-addressed caching means the
+            // second call is cheap when the two windows overlap.
+            let shape_window = |anchor_line: usize,
+                                 anchor_offset: f32,
+                                 previous: &[Row<Renderer::Paragraph>]|
+             -> (Vec<Row<Renderer::Paragraph>>, f32) {
+                let windowed = window_rows::<Renderer::Font>(
+                    self.buffer,
+                    anchor_line,
+                    max_visible_lines + 2,
+                );
 
-            let mut new_rows = Vec::new();
-            // The anchor row starts partially above the viewport when
-            // `anchor_offset > 0`; it (and only it) gets clipped at the top.
-            let mut y = -anchor_offset;
-            let mut width = 0.0f32;
-
-            for (source_start, row_spans) in &windowed {
-                // Stop shaping once the viewport is full: rows further down
-                // the window were only speculatively sliced from the rope,
-                // never touched, and cost nothing.
-                if y >= para_bounds.height {
-                    break;
-                }
-
-                let text = row_text(row_spans);
-
-                let cached = by_key
-                    .get(text.as_ref())
-                    .map(|&i| previous[i].paragraph.clone());
-                let (mut paragraph, mut needs_shape) = match cached {
-                    Some(p) => (p, false),
-                    None => (Renderer::Paragraph::default(), true),
-                };
-
-                if !needs_shape {
-                    match paragraph.compare(desired) {
-                        text_advanced::Difference::None => {}
-                        text_advanced::Difference::Bounds => paragraph.resize(para_bounds),
-                        text_advanced::Difference::Shape => needs_shape = true,
+                // Index the previous frame's shaped rows by their text, so
+                // an unchanged line reuses its paragraph (cheap Arc clone)
+                // instead of being reshaped. Indexed by content, not
+                // position: inserting or deleting a line shifts indices but
+                // not surviving rows' text. Rows that scrolled offscreen
+                // are simply never looked up again and drop here, which is
+                // exactly the eviction we want.
+                let mut by_key: HashMap<&str, usize> = HashMap::with_capacity(previous.len());
+                for (i, row) in previous.iter().enumerate() {
+                    if let Some(text) = shaped_text(&row.paragraph) {
+                        by_key.entry(text).or_insert(i);
                     }
                 }
 
-                if needs_shape {
-                    paragraph = Renderer::Paragraph::with_spans(text_advanced::Text {
-                        content: row_spans.as_slice(),
-                        bounds: para_bounds,
-                        size,
-                        line_height: self.line_height,
-                        font,
-                        align_x: self.align_x,
-                        align_y: self.align_y,
-                        shaping: Shaping::Advanced,
-                        wrapping: self.wrapping,
-                        ellipsis: self.ellipsis,
-                        hint_factor: renderer.scale_factor(),
+                let mut new_rows = Vec::new();
+                // The anchor row starts partially above the viewport when
+                // `anchor_offset > 0`; it (and only it) gets clipped at the
+                // top.
+                //
+                // `y` is kept a whole pixel at every step (snap the start,
+                // then advance by a rounded height) rather than
+                // accumulating raw sub-pixel floats. Rounding each row's
+                // *absolute* position independently would still leave
+                // neighboring rows off by a pixel from each other whenever
+                // their rounding landed on opposite sides of .5 — this
+                // keeps inter-row spacing constant instead, which is what
+                // actually reads as stable to the eye.
+                let mut y = -anchor_offset.round();
+                let mut width = 0.0f32;
+
+                for (source_start, row_spans) in &windowed {
+                    // Stop shaping once the viewport is full: rows further
+                    // down the window were only speculatively sliced from
+                    // the rope, never touched, and cost nothing.
+                    if y >= para_bounds.height {
+                        break;
+                    }
+
+                    let text = row_text(row_spans);
+
+                    let cached = by_key
+                        .get(text.as_ref())
+                        .map(|&i| previous[i].paragraph.clone());
+                    let (mut paragraph, mut needs_shape) = match cached {
+                        Some(p) => (p, false),
+                        None => (Renderer::Paragraph::default(), true),
+                    };
+
+                    if !needs_shape {
+                        match paragraph.compare(desired) {
+                            text_advanced::Difference::None => {}
+                            text_advanced::Difference::Bounds => paragraph.resize(para_bounds),
+                            text_advanced::Difference::Shape => needs_shape = true,
+                        }
+                    }
+
+                    if needs_shape {
+                        paragraph = Renderer::Paragraph::with_spans(text_advanced::Text {
+                            content: row_spans.as_slice(),
+                            bounds: para_bounds,
+                            size,
+                            line_height: self.line_height,
+                            font,
+                            align_x: self.align_x,
+                            align_y: self.align_y,
+                            shaping: Shaping::Advanced,
+                            wrapping: self.wrapping,
+                            ellipsis: self.ellipsis,
+                            hint_factor: renderer.scale_factor(),
+                        });
+                    }
+
+                    let min_bounds = paragraph.min_bounds();
+                    width = width.max(min_bounds.width);
+                    let height = min_bounds.height.round();
+
+                    new_rows.push(Row {
+                        source_start: *source_start,
+                        paragraph,
+                        text_len: text.len(),
+                        y,
+                        height,
                     });
+                    y += height;
                 }
 
-                let min_bounds = paragraph.min_bounds();
-                width = width.max(min_bounds.width);
-                let height = min_bounds.height;
+                (new_rows, width)
+            };
 
-                new_rows.push(Row {
-                    source_start: *source_start,
-                    paragraph,
-                    text_len: text.len(),
-                    y,
-                    height,
-                });
-                y += height;
+            let previous = std::mem::take(&mut state.rows);
+            let (mut new_rows, mut width) = shape_window(anchor_line, anchor_offset, &previous);
+
+            // Scroll into view: if a keyboard action (typing, arrow keys)
+            // moved the cursor outside the window just rendered, move the
+            // anchor to bring its line back into view and reshape. Cheap
+            // in the common case where the cursor stayed on-screen — this
+            // only adds a second shaping pass when it didn't, and that pass
+            // reuses `new_rows`'s paragraphs by content wherever the two
+            // windows overlap.
+            if let Some(cursor) = self.cursor {
+                let cursor_line = self
+                    .buffer
+                    .byte_to_line(cursor.min(self.buffer.len_bytes()));
+
+                if cursor_line < anchor_line {
+                    anchor_line = cursor_line;
+                    anchor_offset = 0.0;
+                    (new_rows, width) = shape_window(anchor_line, anchor_offset, &new_rows);
+                } else if cursor_line >= anchor_line + new_rows.len() {
+                    // Bring the cursor's line to the bottom of the window
+                    // rather than snapping it to the top: a minimal scroll,
+                    // not an overshoot.
+                    anchor_line = cursor_line.saturating_sub(new_rows.len().saturating_sub(1));
+                    anchor_offset = 0.0;
+                    (new_rows, width) = shape_window(anchor_line, anchor_offset, &new_rows);
+                }
+
+                self.scroll_anchor.set((anchor_line, anchor_offset));
             }
 
+            let _ = width;
             state.rows = new_rows;
             state.anchor_line = anchor_line;
 
@@ -422,7 +484,16 @@ where
         }
 
         let size = self.size.unwrap_or_else(|| renderer.default_size());
+        let font = self.font.unwrap_or_else(|| renderer.default_font());
         let line_height_px = f32::from(self.line_height.to_absolute(size)).max(1.0);
+
+        let gutter = if self.show_line_numbers {
+            gutter_width()
+        } else {
+            0.0
+        };
+        let bounds = layout.bounds();
+        let para_bounds = Size::new((bounds.width - gutter).max(0.0), bounds.height);
 
         // Matches the sign convention of `iced::widget::scrollable`: negate
         // the raw wheel delta before applying it. `Lines` deltas are turned
@@ -442,13 +513,41 @@ where
             let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
 
             // Prefer a row's actual shaped height when it's part of what's
-            // currently on screen; anything further out (a fast fling past
-            // the visible window) falls back to the no-wrap estimate rather
-            // than shaping offscreen rows just to scroll past them.
+            // currently on screen. Otherwise shape just that one line to
+            // measure its *true* height rather than assuming one line's
+            // worth: a wrapped row is several visual lines tall, and
+            // treating it as one would under-count the scroll distance
+            // needed to fully pass it, causing a visible jump once `layout`
+            // later shapes it for real and its true height doesn't match
+            // what this scroll math assumed. Bounded cost: a wheel event
+            // only ever walks a handful of lines past what's cached.
             let height_of = |line: usize| -> f32 {
-                line.checked_sub(state.anchor_line)
+                if let Some(row) = line
+                    .checked_sub(state.anchor_line)
                     .and_then(|i| state.rows.get(i))
-                    .map(|row| row.height)
+                {
+                    return row.height;
+                }
+
+                window_rows::<Renderer::Font>(self.buffer, line, 1)
+                    .first()
+                    .map(|(_, spans)| {
+                        Renderer::Paragraph::with_spans(text_advanced::Text {
+                            content: spans.as_slice(),
+                            bounds: para_bounds,
+                            size,
+                            line_height: self.line_height,
+                            font,
+                            align_x: self.align_x,
+                            align_y: self.align_y,
+                            shaping: Shaping::Advanced,
+                            wrapping: self.wrapping,
+                            ellipsis: self.ellipsis,
+                            hint_factor: renderer.scale_factor(),
+                        })
+                        .min_bounds()
+                        .height
+                    })
                     .unwrap_or(line_height_px)
             };
 
@@ -466,9 +565,9 @@ where
             while offset >= 0.0 {
                 let h = height_of(line);
                 if line + 1 >= n_lines {
-                    // Nothing more to scroll into: bound the overscroll to
-                    // one line's worth instead of growing without limit.
-                    offset = offset.min(h);
+                    // The last line stops flush at the top: nothing below
+                    // it to scroll into, so no overscroll allowed here.
+                    offset = 0.0;
                     break;
                 }
                 if offset < h {
@@ -512,86 +611,120 @@ where
         let text_anchor = Point::new(anchor.x + gutter, anchor.y);
 
         let color = appearance.color.unwrap_or(style.text_color);
+        let size = self.size.unwrap_or_else(|| renderer.default_size());
+        let line_height_px = f32::from(self.line_height.to_absolute(size)).max(1.0);
 
-        // Selection is its own layer beneath the gutter and the text: drawn
-        // first, so everything else paints on top of it.
-        if let Some(selection) = &self.selection {
-            draw_selection(renderer, &state.rows, text_anchor, selection);
-        }
+        // Rows are shaped independently of where they'll be drawn (see
+        // `layout`), so a row scrolled partway off the top or bottom of
+        // *this widget's own bounds* still renders its full, unclipped
+        // height — without an explicit clip here, that overflow bleeds into
+        // whatever is above/below us (padding, a sibling like the HUD)
+        // instead of visibly cropping at our own edge. `with_layer` scopes
+        // every draw call below (including `fill_quad`, which has no
+        // per-call clip parameter of its own) to `bounds`.
+        let clip = bounds.intersection(viewport).unwrap_or(bounds);
+        renderer.with_layer(clip, |renderer| {
+            // Selection is its own layer beneath the gutter and the text:
+            // drawn first, so everything else paints on top of it.
+            if let Some(selection) = &self.selection {
+                draw_selection(renderer, &state.rows, text_anchor, selection);
+            }
 
-        // Draw line numbers in the gutter: one per row, at that row's top.
-        if self.show_line_numbers {
-            for (i, row) in state.rows.iter().enumerate() {
-                let text = text_advanced::Text {
-                    content: format!("{}", state.anchor_line + i + 1),
-                    bounds: Size::new(gutter - 8.0, row.height),
-                    size: self.size.unwrap_or_else(|| renderer.default_size()),
-                    line_height: self.line_height,
-                    font: self.font.unwrap_or_else(|| renderer.default_font()),
-                    align_x: text_advanced::Alignment::Right,
-                    align_y: alignment::Vertical::Top,
-                    shaping: Shaping::Advanced,
-                    wrapping: Wrapping::None,
-                    ellipsis: Ellipsis::None,
-                    hint_factor: None,
-                };
-                renderer.fill_text(
-                    text,
-                    // `Alignment::Right` anchors the text's *right* edge at
-                    // `position.x`, not the box's left edge.
-                    Point::new(anchor.x + gutter - 8.0, anchor.y + row.y),
-                    Color::from_rgb(0.5, 0.5, 0.5),
-                    *viewport,
+            // Draw line numbers in the gutter: one per row, at that row's top.
+            if self.show_line_numbers {
+                for (i, row) in state.rows.iter().enumerate() {
+                    let text = text_advanced::Text {
+                        content: format!("{}", state.anchor_line + i + 1),
+                        bounds: Size::new(gutter - 8.0, row.height),
+                        size: self.size.unwrap_or_else(|| renderer.default_size()),
+                        line_height: self.line_height,
+                        font: self.font.unwrap_or_else(|| renderer.default_font()),
+                        align_x: text_advanced::Alignment::Right,
+                        align_y: alignment::Vertical::Top,
+                        shaping: Shaping::Advanced,
+                        wrapping: Wrapping::None,
+                        ellipsis: Ellipsis::None,
+                        hint_factor: None,
+                    };
+                    renderer.fill_text(
+                        text,
+                        // `Alignment::Right` anchors the text's *right* edge at
+                        // `position.x`, not the box's left edge.
+                        Point::new(anchor.x + gutter - 8.0, anchor.y + row.y),
+                        Color::from_rgb(0.5, 0.5, 0.5),
+                        clip,
+                    );
+                }
+            }
+
+            for row in &state.rows {
+                renderer.fill_paragraph(
+                    &row.paragraph,
+                    Point::new(text_anchor.x, text_anchor.y + row.y),
+                    color,
+                    clip,
                 );
             }
-        }
 
-        for row in &state.rows {
-            renderer.fill_paragraph(
-                &row.paragraph,
-                Point::new(text_anchor.x, text_anchor.y + row.y),
-                color,
-                *viewport,
-            );
-        }
+            if let Some(cursor) = self.cursor
+                && cursor <= self.buffer.len_bytes()
+            {
+                draw_cursor(
+                    renderer,
+                    &state.rows,
+                    text_anchor,
+                    cursor,
+                    color,
+                    self.cursor_width,
+                );
+            }
 
-        if let Some(cursor) = self.cursor
-            && cursor <= self.buffer.len_bytes()
-        {
-            draw_cursor(
+            let (_, anchor_offset) = self.scroll_anchor.get();
+            draw_scrollbar(
                 renderer,
-                &state.rows,
-                text_anchor,
-                cursor,
-                color,
-                self.cursor_width,
+                bounds,
+                state.rows.len(),
+                self.buffer.len_lines(),
+                state.anchor_line,
+                anchor_offset,
+                line_height_px,
             );
-        }
-
-        draw_scrollbar(
-            renderer,
-            bounds,
-            state.rows.len(),
-            self.buffer.len_lines(),
-            state.anchor_line,
-        );
+        });
     }
 }
 
 const SCROLLBAR_WIDTH: f32 = 6.0;
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 
+/// Where the scrollbar thumb sits along the track, as a `0.0..=1.0`
+/// fraction. Folding `anchor_offset` in (not just the discrete
+/// `anchor_line`) is what makes the thumb track pixel-wise scrolling
+/// smoothly instead of only moving once per whole line crossed.
+fn scrollbar_fraction(
+    anchor_line: usize,
+    anchor_offset: f32,
+    line_height_px: f32,
+    n_lines: usize,
+    visible_rows: usize,
+) -> f32 {
+    let max_scroll_lines = (n_lines - visible_rows).max(1) as f32;
+    let effective_line = anchor_line as f32 + anchor_offset / line_height_px.max(1.0);
+    (effective_line / max_scroll_lines).clamp(0.0, 1.0)
+}
+
 /// A minimal position/proportion indicator on the right edge, not a
 /// scrollable control (not yet interactive). Sized and positioned purely
-/// from line *counts* (visible rows vs. total lines), never from total
-/// document height, so it costs nothing beyond what's already shaped for
-/// virtualization.
+/// from line *counts* (visible rows vs. total lines) plus the sub-line
+/// pixel offset, never from total document height, so it costs nothing
+/// beyond what's already shaped for virtualization.
 fn draw_scrollbar<Renderer: renderer::Renderer>(
     renderer: &mut Renderer,
     bounds: Rectangle,
     visible_rows: usize,
     n_lines: usize,
     anchor_line: usize,
+    anchor_offset: f32,
+    line_height_px: f32,
 ) {
     if n_lines == 0 || visible_rows >= n_lines {
         return;
@@ -602,8 +735,13 @@ fn draw_scrollbar<Renderer: renderer::Renderer>(
         .max(SCROLLBAR_MIN_THUMB)
         .min(track_height);
 
-    let max_scroll_lines = (n_lines - visible_rows).max(1) as f32;
-    let scroll_fraction = (anchor_line as f32 / max_scroll_lines).clamp(0.0, 1.0);
+    let scroll_fraction = scrollbar_fraction(
+        anchor_line,
+        anchor_offset,
+        line_height_px,
+        n_lines,
+        visible_rows,
+    );
     let thumb_y = bounds.y + scroll_fraction * (track_height - thumb_height);
     let track_x = bounds.x + bounds.width - SCROLLBAR_WIDTH;
 
@@ -841,6 +979,138 @@ mod tests {
         assert!(
             line > 0 || offset > 0.0,
             "20 events of 5px each should move the anchor, got (line={line}, offset={offset})"
+        );
+    }
+
+    /// Regression test: scrolling down used to be unbounded, letting the
+    /// last line scroll all the way up past the top of the viewport and
+    /// leave blank space below it. It should stop with the last line
+    /// flush at the top instead.
+    #[test]
+    fn scrolling_down_stops_with_last_line_flush_at_top() {
+        let mut text = String::new();
+        for i in 1..=10 {
+            text.push_str(&format!("line {i}\n"));
+        }
+        let buffer = Rope::from_str(&text);
+        let nav_width = Cell::new(800.0);
+        let scroll_anchor = Cell::new((0usize, 0.0f32));
+
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
+            EditorParagraph::new(&buffer, None, &nav_width, &scroll_anchor)
+                .size(24.0)
+                .into();
+
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(200.0, 200.0),
+            element,
+        );
+        ui.point_at(iced_test::core::Point::new(50.0, 50.0));
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        // Wildly overscroll: many large downward deltas, far more than the
+        // document is tall.
+        for _ in 0..20 {
+            ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -500.0 },
+            })]);
+        }
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        let n_lines = buffer.len_lines();
+        assert_eq!(
+            scroll_anchor.get(),
+            (n_lines - 1, 0.0),
+            "the last line should stop flush at the top, not scroll past it"
+        );
+    }
+
+    /// Regression test: the scrollbar thumb used to be positioned purely
+    /// from the discrete `anchor_line`, so it only moved once per whole
+    /// line crossed instead of tracking pixel-wise scroll smoothly. Two
+    /// different sub-line offsets on the *same* line must produce
+    /// different fractions.
+    #[test]
+    fn scrollbar_fraction_reflects_sub_line_offset() {
+        let at_top_of_line = scrollbar_fraction(2, 0.0, 31.2, 100, 10);
+        let halfway_into_line = scrollbar_fraction(2, 15.6, 31.2, 100, 10);
+        let at_next_line = scrollbar_fraction(3, 0.0, 31.2, 100, 10);
+
+        assert!(
+            at_top_of_line < halfway_into_line,
+            "scrolling within a line should move the thumb, not just crossing lines"
+        );
+        assert!(
+            halfway_into_line < at_next_line,
+            "half a line of offset should sit strictly between the two line boundaries"
+        );
+    }
+
+    /// Regression test: scrolling up used to assume every line is exactly
+    /// one line tall when computing how far back to walk, since the line
+    /// being entered is never part of the currently-rendered (forward-only)
+    /// window and fell back to that estimate. For a row that word-wraps
+    /// into several visual lines, that under-counted its real height,
+    /// leaving `scroll_anchor` inconsistent with what `layout` discovers
+    /// once it actually shapes the row — the visible symptom was a sudden
+    /// jump in content right as a wrapped row scrolled into view.
+    #[test]
+    fn scrolling_up_into_a_wrapped_row_uses_its_true_height() {
+        let long_line = "wrap ".repeat(40); // wraps into several visual lines in a narrow viewport
+        let text = format!("short\n{long_line}\nend\nafter\n");
+        let buffer = Rope::from_str(&text);
+        let nav_width = Cell::new(100.0);
+        let scroll_anchor = Cell::new((0usize, 0.0f32));
+
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
+            EditorParagraph::new(&buffer, None, &nav_width, &scroll_anchor)
+                .size(24.0)
+                .into();
+
+        // Narrow viewport forces `long_line` to wrap into multiple visual
+        // lines instead of fitting on one.
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(100.0, 300.0),
+            element,
+        );
+        ui.point_at(iced_test::core::Point::new(50.0, 50.0));
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        // Scroll all the way down: with the end-of-document clamp, the
+        // anchor lands on the last line with zero offset regardless of how
+        // large the delta is.
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Pixels {
+                x: 0.0,
+                y: -10_000.0,
+            },
+        })]);
+        let _ = ui.snapshot(&iced::Theme::Light);
+        let n_lines = buffer.len_lines();
+        assert_eq!(scroll_anchor.get(), (n_lines - 1, 0.0));
+
+        // Scroll back up by enough to pass the three trailing single-line
+        // rows (~31px each) and land inside the wrapped row (line 1). The
+        // buggy version treated line 1 as one line tall too, so it kept
+        // consuming budget past it and overshot all the way to line 0;
+        // fixed, it stops on line 1 with an offset reflecting its real,
+        // much larger wrapped height.
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: 100.0 },
+        })]);
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        let (line, offset) = scroll_anchor.get();
+        assert_eq!(
+            line, 1,
+            "should have stopped on the wrapped line, not overshot past it"
+        );
+        assert!(
+            offset > 31.2,
+            "offset {offset} should reflect line 1's true (wrapped, multi-line) height, \
+             not a single line's height — using the wrong height is what caused the jump"
         );
     }
 }

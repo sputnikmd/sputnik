@@ -192,4 +192,63 @@ mod tests {
         let result = load_file("/nonexistent/path/for/sputnik-test.txt").await;
         assert!(result.is_err());
     }
+
+    /// Regression test for a real bug: the isolated `editor.view()` element
+    /// (used by the other snapshot tests) always starts at bounds origin
+    /// y≈0, so a scrolled-off row's unclipped overflow has nowhere to go
+    /// and the bug was invisible there. Reproducing the *actual*
+    /// `container(column![editor, hud]).padding(32.0)` composition — where
+    /// the editor's bounds start at a positive y and end above the HUD's
+    /// row — showed the real failure: without an explicit clip in
+    /// `EditorParagraph::draw`, a row scrolled partway off the top bled
+    /// into the padding above instead of visibly cropping, and a row
+    /// overflowing the bottom bled into the HUD's row instead of stopping
+    /// at the editor's own boundary.
+    #[test]
+    fn scrolled_content_clips_to_editor_bounds_not_surroundings() {
+        let readme = std::fs::read_to_string(INITIAL_FILE).expect("README.md should exist");
+        let mut editor = Editor::<()>::new(Rope::from_str(""));
+        for ch in readme.chars() {
+            editor.action(Action::Insert(ch));
+        }
+
+        let hud: iced::Element<'_, (), iced::Theme, iced::Renderer> =
+            text("cursor: 0/0").size(14.0).into();
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = container(
+            iced::widget::column![editor.view(), hud]
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .padding(32.0)
+        .into();
+
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(500.0, 300.0),
+            element,
+        );
+        ui.point_at(iced_test::core::Point::new(50.0, 50.0));
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        for (label, delta) in [("5", -5.0), ("20", -20.0), ("28", -28.0)] {
+            ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: delta },
+            })]);
+            let snapshot = ui
+                .snapshot(&iced::Theme::Light)
+                .expect("snapshot should render");
+            let matches = snapshot
+                .matches_image(
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/snapshots/real_composition_scroll_"
+                    )
+                    .to_owned()
+                        + label
+                        + ".png",
+                )
+                .expect("snapshot should save");
+            assert!(matches, "scrolled rendering drifted at {label}px");
+        }
+    }
 }

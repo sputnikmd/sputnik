@@ -28,3 +28,6 @@ target
 /.direnv
 
 /.claude
+
+# iced_test headless render snapshots (auto-generated on first test run)
+sputnik_gui/tests/snapshots/
