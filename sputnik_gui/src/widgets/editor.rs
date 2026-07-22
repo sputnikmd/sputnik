@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::ops::Range;
 
 use ropey::Rope;
 
@@ -17,6 +18,15 @@ pub enum Action {
     DeleteForward,
 }
 
+/// Normalizes `start`/`end` into ascending order and clips both to `len`.
+/// Returns `None` when that leaves nothing selected (an empty or fully
+/// out-of-bounds range), rather than a vacuous `Some(x..x)`.
+fn clamp_selection(start: usize, end: usize, len: usize) -> Option<Range<usize>> {
+    let (start, end) = (start.min(len), end.min(len));
+    let (start, end) = (start.min(end), start.max(end));
+    (start < end).then_some(start..end)
+}
+
 pub struct Editor<Message> {
     buffer: Rope,
     cursor: usize,
@@ -28,6 +38,9 @@ pub struct Editor<Message> {
     /// scrolled above the viewport. Interior mutability for the same reason
     /// as `nav_width`: the widget updates it on scroll.
     scroll_anchor: Cell<(usize, f32)>,
+    /// Selected char range, `start..end` with `start <= end`. `None` means
+    /// no selection.
+    selection: Option<Range<usize>>,
     _phantom: std::marker::PhantomData<Message>,
 }
 
@@ -39,6 +52,7 @@ impl<Message> Editor<Message> {
             tab_size: 4,
             nav_width: Cell::new(800.0),
             scroll_anchor: Cell::new((0, 0.0)),
+            selection: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -241,7 +255,15 @@ impl<Message> Editor<Message> {
 
     pub fn edit(&mut self, f: impl FnOnce(&mut Rope)) {
         f(&mut self.buffer);
-        self.cursor = self.cursor.min(self.buffer.len_chars());
+        let len = self.buffer.len_chars();
+        self.cursor = self.cursor.min(len);
+        // An edit can shrink the buffer out from under a selection set
+        // before it (e.g. deleting past what was selected): re-clamp rather
+        // than let it go stale and panic on the next `char_to_byte`.
+        self.selection = self
+            .selection
+            .take()
+            .and_then(|range| clamp_selection(range.start, range.end, len));
     }
 
     pub fn cursor(&self) -> usize {
@@ -250,6 +272,44 @@ impl<Message> Editor<Message> {
 
     pub fn total_chars(&self) -> usize {
         self.buffer.len_chars()
+    }
+
+    /// Sets the selection to the char range between `a` and `b`, in either
+    /// order. Out-of-bounds endpoints are clipped to the buffer's length;
+    /// if that clipping collapses the range to empty, the selection is
+    /// cleared instead of kept as a vacuous `Some(x..x)`.
+    ///
+    /// Not yet called from `Application` — no selection gesture (mouse drag,
+    /// shift+arrow) is wired up yet, only the widget-level rendering and
+    /// this API to drive it.
+    #[allow(dead_code)]
+    pub fn select(&mut self, a: usize, b: usize) {
+        self.selection = clamp_selection(a, b, self.buffer.len_chars());
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    #[allow(dead_code)]
+    pub fn selection(&self) -> Option<Range<usize>> {
+        self.selection.clone()
+    }
+
+    /// The current selection as a byte range, for the widget layer (which
+    /// otherwise deals only in byte offsets into the rope).
+    ///
+    /// Re-validates against the current buffer length even though `select`
+    /// and `edit` already keep `self.selection` in bounds: this is the last
+    /// line of defense before the only place that can actually panic
+    /// (`char_to_byte` on an out-of-bounds char index), so it stays correct
+    /// even if some future caller mutates `self.selection` directly.
+    fn flat_selection(&self) -> Option<Range<usize>> {
+        let selection = self.selection.as_ref()?;
+        let len = self.buffer.len_chars();
+        let range = clamp_selection(selection.start, selection.end, len)?;
+        Some(self.buffer.char_to_byte(range.start)..self.buffer.char_to_byte(range.end))
     }
 
     pub fn view(&self) -> EditorParagraph<'_, iced::Theme, iced::Renderer> {
@@ -261,6 +321,7 @@ impl<Message> Editor<Message> {
         )
         .size(FONT_SIZE)
         .show_line_numbers(true)
+        .selection(self.flat_selection())
     }
 }
 
@@ -280,6 +341,69 @@ mod tests {
         editor.action(Action::DeleteBackward);
         assert_eq!(editor.cursor(), 1);
         assert_eq!(editor.buffer.to_string(), "a");
+    }
+
+    #[test]
+    fn select_normalizes_order_and_clamps_to_buffer_len() {
+        let mut editor = Editor::<()>::new(Rope::from_str("hello world"));
+
+        editor.select(2, 5);
+        assert_eq!(editor.selection(), Some(2..5));
+
+        // Reversed endpoints (selecting backwards) still normalize to a
+        // forward range.
+        editor.select(5, 2);
+        assert_eq!(editor.selection(), Some(2..5));
+
+        // Out-of-bounds endpoints clamp to the buffer's length.
+        editor.select(8, 1000);
+        assert_eq!(editor.selection(), Some(8..11));
+
+        editor.clear_selection();
+        assert_eq!(editor.selection(), None);
+    }
+
+    #[test]
+    fn select_on_empty_buffer_does_not_panic() {
+        let mut editor = Editor::<()>::new(Rope::from_str(""));
+        editor.select(5, 10);
+        assert_eq!(editor.selection(), None);
+        assert_eq!(editor.flat_selection(), None);
+    }
+
+    #[test]
+    fn selection_partially_out_of_bounds_after_shrink_is_clamped() {
+        let mut editor = Editor::<()>::new(Rope::from_str("hello world"));
+        editor.select(2, 8);
+
+        // Shrink so only the selection's start remains valid.
+        editor.edit(|rope| rope.remove(4..rope.len_chars()));
+
+        assert_eq!(editor.selection(), Some(2..4));
+    }
+
+    /// Regression test for a panic report: selecting a range and then
+    /// deleting the buffer out from under it left a stale, out-of-bounds
+    /// selection that `char_to_byte` panicked on the next time `view()`
+    /// rendered it.
+    #[test]
+    fn selection_survives_edits_that_shrink_the_buffer_without_panicking() {
+        let mut editor = Editor::<()>::new(Rope::from_str("hello world"));
+        editor.select(2, 8);
+        assert_eq!(editor.selection(), Some(2..8));
+
+        editor.edit(|rope| rope.remove(0..rope.len_chars()));
+
+        assert_eq!(editor.selection(), None);
+        assert_eq!(editor.flat_selection(), None);
+
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(200.0, 200.0),
+            element,
+        );
+        let _ = ui.snapshot(&iced::Theme::Light);
     }
 
     /// Headless render regression test: catches vertical-rhythm, gutter and
@@ -323,6 +447,41 @@ mod tests {
         assert!(
             matches,
             "rendering drifted from the committed reference image"
+        );
+    }
+
+    /// Headless render regression test for the selection layer: a selection
+    /// spanning from partway into the first line to partway into the second
+    /// should highlight to the end of the first line and from the start of
+    /// the second, exercising the per-row intersection math in
+    /// `draw_selection`.
+    #[test]
+    fn snapshot_selection() {
+        let mut editor = Editor::<()>::new(Rope::from_str(""));
+        let text = "The quick brown fox\nSecond line here\nThird line\n";
+        for ch in text.chars() {
+            editor.action(Action::Insert(ch));
+        }
+        editor.select(10, 27);
+
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(360.0, 160.0),
+            element,
+        );
+        let snapshot = ui
+            .snapshot(&iced::Theme::Light)
+            .expect("snapshot should render");
+        let matches = snapshot
+            .matches_image(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/snapshots/editor_selection.png"
+            ))
+            .expect("snapshot should save");
+        assert!(
+            matches,
+            "selection rendering drifted from the committed reference image"
         );
     }
 

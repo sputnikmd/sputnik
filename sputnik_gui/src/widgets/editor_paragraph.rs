@@ -25,6 +25,9 @@ where
     buffer: &'a Rope,
     show_line_numbers: bool,
     cursor: Option<usize>,
+    /// Selected byte range into the buffer, `start..end` with `start <=
+    /// end`. Rendered as a layer beneath the text.
+    selection: Option<Range<usize>>,
     size: Option<Pixels>,
     line_height: LineHeight,
     width: Length,
@@ -90,6 +93,7 @@ where
             buffer,
             show_line_numbers: false,
             cursor,
+            selection: None,
             size: None,
             line_height: LineHeight::default(),
             width: Length::Fill,
@@ -108,6 +112,11 @@ where
 
     pub fn show_line_numbers(mut self, show: bool) -> Self {
         self.show_line_numbers = show;
+        self
+    }
+
+    pub fn selection(mut self, selection: Option<Range<usize>>) -> Self {
+        self.selection = selection;
         self
     }
 
@@ -504,6 +513,12 @@ where
 
         let color = appearance.color.unwrap_or(style.text_color);
 
+        // Selection is its own layer beneath the gutter and the text: drawn
+        // first, so everything else paints on top of it.
+        if let Some(selection) = &self.selection {
+            draw_selection(renderer, &state.rows, text_anchor, selection);
+        }
+
         // Draw line numbers in the gutter: one per row, at that row's top.
         if self.show_line_numbers {
             for (i, row) in state.rows.iter().enumerate() {
@@ -635,6 +650,69 @@ where
 {
     fn from(text: EditorParagraph<'a, Theme, Renderer>) -> Element<'a, Message, Theme, Renderer> {
         Element::new(text)
+    }
+}
+
+const SELECTION_COLOR: Color = Color::from_rgba(0.2, 0.5, 1.0, 0.35);
+
+/// Highlight quads for the intersection of `selection` with each currently
+/// rendered row. Purely additive over what's already shaped for
+/// virtualization: reads each row's own `cosmic_text` buffer, never shapes
+/// anything new.
+fn draw_selection<Renderer: text_advanced::Renderer>(
+    renderer: &mut Renderer,
+    rows: &[Row<Renderer::Paragraph>],
+    anchor: Point,
+    selection: &Range<usize>,
+) {
+    if selection.start >= selection.end {
+        return;
+    }
+
+    for row in rows {
+        let row_end = row.source_start + row.text_len;
+        if selection.end <= row.source_start || selection.start > row_end {
+            continue;
+        }
+
+        let local_start = selection.start.saturating_sub(row.source_start);
+        let local_end = selection
+            .end
+            .saturating_sub(row.source_start)
+            .min(row.text_len);
+
+        let hint = Paragraph::hint_factor(&row.paragraph).unwrap_or(1.0);
+        let any: &dyn Any = &row.paragraph as &dyn Any;
+        let Some(gp) = any.downcast_ref::<GraphicsParagraph>() else {
+            continue;
+        };
+        let line_len = gp
+            .buffer()
+            .lines
+            .first()
+            .map(|l| l.text().len())
+            .unwrap_or(0);
+        let cursor_start = cosmic_text::Cursor::new(0, local_start.min(line_len));
+        let cursor_end = cosmic_text::Cursor::new(0, local_end.min(line_len));
+
+        for run in gp.buffer().layout_runs() {
+            for (x, width) in run.highlight(cursor_start, cursor_end) {
+                renderer.fill_quad(
+                    Quad {
+                        bounds: Rectangle {
+                            x: anchor.x + x / hint,
+                            y: anchor.y + row.y + run.line_top / hint,
+                            width: width / hint,
+                            height: (run.line_height + 1.0) / hint,
+                        },
+                        border: iced::Border::default(),
+                        shadow: iced::Shadow::default(),
+                        snap: true,
+                    },
+                    Background::Color(SELECTION_COLOR),
+                );
+            }
+        }
     }
 }
 
