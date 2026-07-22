@@ -3566,17 +3566,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "sputnik_editor"
+version = "0.1.0"
+dependencies = [
+ "cosmic-text",
+ "iced",
+ "iced_test",
+ "ropey",
+]
+
+[[package]]
 name = "sputnik_gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "cosmic-text",
  "iced",
  "iced_test",
  "rfd",
  "ropey",
  "smol_str 0.2.2",
+ "sputnik_editor",
  "tokio",
  "tracing",
  "winresource",

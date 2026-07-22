@@ -14,7 +14,7 @@ use tracing::{debug, error, info};
 
 use crate::APP_ICON;
 use crate::message::{self, Message};
-use crate::widgets::{Action, Editor};
+use sputnik_editor::{Action, Editor};
 
 pub struct Application {
     window_id: iced::window::Id,

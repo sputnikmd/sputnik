@@ -3,7 +3,6 @@
 mod application;
 mod cli;
 mod message;
-mod widgets;
 
 use clap::Parser;
 

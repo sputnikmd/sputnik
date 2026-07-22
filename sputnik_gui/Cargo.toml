@@ -18,12 +18,11 @@ version = "4"
 features = ["derive"]
 
 [dependencies.iced]
-git = "https://github.com/iced-rs/iced.git"
-rev = "d7f5627a7581e92e4c928f7f1a180061dc6c7eb5"
+workspace = true
 features = ["canvas", "advanced", "image", "tokio"]
 
-[dependencies.cosmic-text]
-version = "0.19"
+[dependencies.sputnik_editor]
+path = "../sputnik_editor"
 
 [dependencies.anyhow]
 workspace = true
@@ -39,5 +38,4 @@ features = ["fs", "rt", "macros"]
 version = "0.1"
 
 [dev-dependencies.iced_test]
-git = "https://github.com/iced-rs/iced.git"
-rev = "d7f5627a7581e92e4c928f7f1a180061dc6c7eb5"
+workspace = true

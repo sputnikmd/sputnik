@@ -1,0 +1,18 @@
+[package]
+name = "sputnik_editor"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+ropey = "1.6.1"
+
+[dependencies.iced]
+workspace = true
+features = ["advanced"]
+
+[dependencies.cosmic-text]
+workspace = true
+
+[dev-dependencies.iced_test]
+workspace = true

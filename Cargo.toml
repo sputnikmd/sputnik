@@ -1,5 +1,5 @@
 [workspace]
-members = ["sputnik_gui"]
+members = ["sputnik_gui", "sputnik_editor"]
 resolver = "3"
 
 [workspace.package]
@@ -8,6 +8,9 @@ authors = ["krozzzis"]
 edition = "2024"
 
 [profile.dev]
+opt-level = 1
+
+[profile.dev.package.sputnik_editor]
 opt-level = 1
 
 [profile.dev.package."*"]
@@ -38,3 +41,14 @@ version = "1.0"
 
 [workspace.dependencies.tokio]
 version = "1"
+
+[workspace.dependencies.iced]
+git = "https://github.com/iced-rs/iced.git"
+rev = "d7f5627a7581e92e4c928f7f1a180061dc6c7eb5"
+
+[workspace.dependencies.iced_test]
+git = "https://github.com/iced-rs/iced.git"
+rev = "d7f5627a7581e92e4c928f7f1a180061dc6c7eb5"
+
+[workspace.dependencies.cosmic-text]
+version = "0.19"

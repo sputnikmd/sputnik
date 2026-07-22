@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use ropey::Rope;
 
-use crate::widgets::EditorParagraph;
+use crate::editor_paragraph::EditorParagraph;
 
 const FONT_SIZE: f32 = 24.0;
 
