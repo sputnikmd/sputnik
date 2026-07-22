@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use iced::event::{self, Event};
@@ -15,23 +16,20 @@ use crate::APP_ICON;
 use crate::message::{self, Message};
 use crate::widgets::{Action, Editor};
 
-/// File opened on startup. Hardcoded for now — there's no file picker yet.
-const INITIAL_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../README.md");
-
 pub struct Application {
     window_id: iced::window::Id,
     editor: Editor<Message>,
 }
 
-async fn load_file(path: &'static str) -> Result<Arc<String>, io::ErrorKind> {
-    tokio::fs::read_to_string(path)
+async fn load_file(path: PathBuf) -> Result<Arc<String>, (PathBuf, io::ErrorKind)> {
+    tokio::fs::read_to_string(&path)
         .await
         .map(Arc::new)
-        .map_err(|err| err.kind())
+        .map_err(|err| (path, err.kind()))
 }
 
 impl Application {
-    pub fn new() -> (Self, Task<Message>) {
+    pub fn new(file: Option<PathBuf>) -> (Self, Task<Message>) {
         let icon = iced::window::icon::from_file_data(APP_ICON, None).ok();
         let settings = iced::window::Settings {
             exit_on_close_request: false,
@@ -40,11 +38,13 @@ impl Application {
         };
         let (main_window_id, open_main_window) = iced::window::open(settings);
 
-        let tasks = vec![
+        let mut tasks = vec![
             open_main_window
                 .map(|_| Message::Window(message::WindowMessage::InitializedMainWindow)),
-            Task::perform(load_file(INITIAL_FILE), Message::FileOpened),
         ];
+        if let Some(path) = file {
+            tasks.push(Task::perform(load_file(path), Message::FileOpened));
+        }
 
         (
             Self {
@@ -110,8 +110,8 @@ impl Application {
             Message::FileOpened(Ok(content)) => {
                 self.editor = Editor::new(Rope::from_str(&content));
             }
-            Message::FileOpened(Err(err)) => {
-                error!("Failed to open {INITIAL_FILE}: {err:?}");
+            Message::FileOpened(Err((path, err))) => {
+                error!("Failed to open {}: {err:?}", path.display());
             }
 
             Message::None => {}
@@ -176,9 +176,11 @@ impl Application {
 mod tests {
     use super::*;
 
+    const INITIAL_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../README.md");
+
     #[tokio::test]
     async fn initial_file_loads_real_content() {
-        let content = load_file(INITIAL_FILE)
+        let content = load_file(PathBuf::from(INITIAL_FILE))
             .await
             .expect("README.md should load");
         assert!(!content.is_empty());
@@ -189,7 +191,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_file_returns_an_error() {
-        let result = load_file("/nonexistent/path/for/sputnik-test.txt").await;
+        let result = load_file(PathBuf::from("/nonexistent/path/for/sputnik-test.txt")).await;
         assert!(result.is_err());
     }
 

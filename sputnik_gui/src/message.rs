@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use iced::keyboard::Key;
@@ -10,7 +11,7 @@ pub enum Message {
         key: Key,
         text: Option<smol_str::SmolStr>,
     },
-    FileOpened(Result<Arc<String>, io::ErrorKind>),
+    FileOpened(Result<Arc<String>, (PathBuf, io::ErrorKind)>),
     None,
 }
 

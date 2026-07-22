@@ -625,8 +625,7 @@ mod tests {
         editor.action(Action::MoveCursorLeft);
 
         {
-            let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
-                editor.view().into();
+            let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
             let mut ui = iced_test::Simulator::with_size(
                 iced_test::core::Settings::default(),
                 iced_test::core::Size::new(200.0, 200.0),
@@ -682,8 +681,7 @@ mod tests {
         }
 
         {
-            let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
-                editor.view().into();
+            let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
             let mut ui = iced_test::Simulator::with_size(
                 iced_test::core::Settings::default(),
                 iced_test::core::Size::new(200.0, 200.0),
@@ -777,8 +775,7 @@ mod tests {
         // Cursor is now at position 0, on line 0.
 
         {
-            let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
-                editor.view().into();
+            let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
             let mut ui = iced_test::Simulator::with_size(
                 iced_test::core::Settings::default(),
                 iced_test::core::Size::new(200.0, 200.0),

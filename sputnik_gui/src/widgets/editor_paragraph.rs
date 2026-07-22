@@ -410,14 +410,11 @@ where
             // has to move the anchor — content-addressed caching means the
             // second call is cheap when the two windows overlap.
             let shape_window = |anchor_line: usize,
-                                 anchor_offset: f32,
-                                 previous: &[Row<Renderer::Paragraph>]|
+                                anchor_offset: f32,
+                                previous: &[Row<Renderer::Paragraph>]|
              -> (Vec<Row<Renderer::Paragraph>>, f32) {
-                let windowed = window_rows::<Renderer::Font>(
-                    self.buffer,
-                    anchor_line,
-                    max_visible_lines + 2,
-                );
+                let windowed =
+                    window_rows::<Renderer::Font>(self.buffer, anchor_line, max_visible_lines + 2);
 
                 // Index the previous frame's shaped rows by their text, so
                 // an unchanged line reuses its paragraph (cheap Arc clone)
