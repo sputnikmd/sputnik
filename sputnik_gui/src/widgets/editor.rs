@@ -1,6 +1,5 @@
 use std::cell::Cell;
 
-use iced::widget::text::Span;
 use ropey::Rope;
 
 use crate::widgets::EditorParagraph;
@@ -25,6 +24,10 @@ pub struct Editor<Message> {
     /// Wrapping width for visual navigation. Interior mutability so callers
     /// with only `&self` can update it after layout.
     nav_width: Cell<f32>,
+    /// Topmost visible logical line. Interior mutability for the same
+    /// reason as `nav_width`: the widget updates it on scroll, `Editor`
+    /// reads it for keyboard-driven navigation.
+    scroll_anchor: Cell<usize>,
     _phantom: std::marker::PhantomData<Message>,
 }
 
@@ -35,6 +38,7 @@ impl<Message> Editor<Message> {
             cursor: 0,
             tab_size: 4,
             nav_width: Cell::new(800.0),
+            scroll_anchor: Cell::new(0),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -248,27 +252,16 @@ impl<Message> Editor<Message> {
         self.buffer.len_chars()
     }
 
-    pub fn view(&self) -> EditorParagraph<'_, (), iced::Theme, iced::Renderer> {
-        // Zero-copy: spans borrow directly from the rope's storage chunks.
-        let spans = rope_to_spans(&self.buffer);
-
-        EditorParagraph::with_spans(spans, Some(self.flat_cursor()), &self.nav_width)
-            .size(FONT_SIZE)
-            .show_line_numbers(true)
+    pub fn view(&self) -> EditorParagraph<'_, iced::Theme, iced::Renderer> {
+        EditorParagraph::new(
+            &self.buffer,
+            Some(self.flat_cursor()),
+            &self.nav_width,
+            &self.scroll_anchor,
+        )
+        .size(FONT_SIZE)
+        .show_line_numbers(true)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Rope → zero-copy Spans for iced.
-// Each contiguous storage chunk of the rope becomes one Cow::Borrowed span.
-// No text is allocated.
-// ---------------------------------------------------------------------------
-
-fn rope_to_spans(rope: &Rope) -> Vec<Span<'_, (), iced::Font>> {
-    rope.chunks()
-        .filter(|c| !c.is_empty())
-        .map(|chunk| Span::new(std::borrow::Cow::Borrowed(chunk)))
-        .collect()
 }
 
 #[cfg(test)]
@@ -321,11 +314,69 @@ mod tests {
         let snapshot = ui
             .snapshot(&iced::Theme::Light)
             .expect("snapshot should render");
-        snapshot
+        let matches = snapshot
             .matches_image(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/snapshots/editor_wrapped_cursor.png"
             ))
             .expect("snapshot should save");
+        assert!(
+            matches,
+            "rendering drifted from the committed reference image"
+        );
+    }
+
+    /// Headless regression test for viewport virtualization: a document
+    /// much taller than the viewport should only render the visible window,
+    /// and wheel scrolling should move that window by whole lines.
+    #[test]
+    fn snapshot_scrolling() {
+        let mut editor = Editor::<()>::new(Rope::from_str(""));
+        let mut text = String::new();
+        for i in 1..=50 {
+            text.push_str(&format!("line {i}\n"));
+        }
+        for ch in text.chars() {
+            editor.action(Action::Insert(ch));
+        }
+
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(200.0, 200.0),
+            element,
+        );
+        ui.point_at(iced_test::core::Point::new(50.0, 50.0));
+
+        let top = ui
+            .snapshot(&iced::Theme::Light)
+            .expect("snapshot should render");
+        let top_matches = top
+            .matches_image(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/snapshots/editor_scroll_top.png"
+            ))
+            .expect("snapshot should save");
+        assert!(top_matches, "top-of-document rendering drifted");
+
+        // Two ticks of -1 line each; the sign convention matches
+        // `iced::widget::scrollable` (raw delta negated), and the widget
+        // multiplies by 3, so this moves the anchor down by 6 lines.
+        for _ in 0..2 {
+            ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            })]);
+        }
+
+        let scrolled = ui
+            .snapshot(&iced::Theme::Light)
+            .expect("snapshot should render");
+        let scrolled_matches = scrolled
+            .matches_image(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/snapshots/editor_scroll_down.png"
+            ))
+            .expect("snapshot should save");
+        assert!(scrolled_matches, "scrolled rendering drifted");
     }
 }

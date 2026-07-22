@@ -4,7 +4,9 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::ops::Range;
 
+use iced::Event;
 use iced::advanced::Layout;
+use iced::advanced::Shell;
 use iced::advanced::graphics::text::Paragraph as GraphicsParagraph;
 use iced::advanced::layout;
 use iced::advanced::mouse;
@@ -13,14 +15,14 @@ use iced::advanced::text::{self as text_advanced, Paragraph};
 use iced::advanced::widget::{self, Tree, Widget};
 use iced::widget::text::{Alignment, Catalog, Ellipsis, LineHeight, Shaping, Span, Wrapping};
 use iced::{Background, Color, Element, Length, Pixels, Point, Rectangle, Size, alignment};
+use ropey::Rope;
 
-pub struct EditorParagraph<'a, Link, Theme, Renderer>
+pub struct EditorParagraph<'a, Theme, Renderer>
 where
-    Link: Clone + 'static,
     Renderer: text_advanced::Renderer,
     Theme: Catalog,
 {
-    spans: Box<dyn AsRef<[Span<'a, Link, Renderer::Font>]> + 'a>,
+    buffer: &'a Rope,
     show_line_numbers: bool,
     cursor: Option<usize>,
     size: Option<Pixels>,
@@ -34,48 +36,61 @@ where
     ellipsis: Ellipsis,
     cursor_width: f32,
     nav_width: &'a Cell<f32>,
+    /// Index of the topmost logical line currently rendered. Scrolling
+    /// moves this by whole lines instead of pixels, so the "how tall is an
+    /// offscreen row" problem never comes up: only rows adjacent to what's
+    /// already visible are ever shaped.
+    scroll_anchor: &'a Cell<usize>,
     class: Theme::Class<'a>,
 }
 
 /// One rendered row, shaped as its own independent [`Paragraph`].
 ///
-/// Rows are cached by their text content (`key`), not by index: an edit
-/// that inserts/removes a line shifts every following row's index but not
-/// its text, so content-addressing lets unrelated rows keep their shaped
-/// paragraph across the edit instead of being invalidated by the shift.
+/// Rows are cached by their text content, not by index: an edit that
+/// inserts/removes a line shifts every following row's index but not its
+/// text, so content-addressing lets unrelated rows keep their shaped
+/// paragraph across the edit instead of being invalidated by the shift. The
+/// comparison text itself isn't stored here — `shaped_text` reads it back
+/// out of the already-shaped `paragraph`, which owns a copy of it anyway.
 struct Row<P> {
-    key: String,
-    /// Byte offset of this row's first character within the flattened content.
+    /// Byte offset of this row's first character within the whole buffer.
     source_start: usize,
     paragraph: P,
+    /// Byte length of this row's text, for the cursor offscreen check.
+    text_len: usize,
+    /// Viewport-relative (not document-relative): 0 is the top of the
+    /// visible window, i.e. the top of `scroll_anchor`'s row.
     y: f32,
     height: f32,
 }
 
 struct State<P> {
     rows: Vec<Row<P>>,
+    /// The `scroll_anchor` value this frame's `rows` were built from, so
+    /// `draw` can recover each row's line number.
+    anchor_line: usize,
 }
 
-impl<'a, Link, Theme, Renderer> EditorParagraph<'a, Link, Theme, Renderer>
+impl<'a, Theme, Renderer> EditorParagraph<'a, Theme, Renderer>
 where
-    Link: Clone + 'static,
     Renderer: text_advanced::Renderer,
     Theme: Catalog,
     Renderer::Font: 'a,
 {
-    pub fn with_spans(
-        spans: impl AsRef<[Span<'a, Link, Renderer::Font>]> + 'a,
+    pub fn new(
+        buffer: &'a Rope,
         cursor: Option<usize>,
         nav_width: &'a Cell<f32>,
+        scroll_anchor: &'a Cell<usize>,
     ) -> Self {
         Self {
-            spans: Box::new(spans),
+            buffer,
             show_line_numbers: false,
             cursor,
             size: None,
             line_height: LineHeight::default(),
-            width: Length::Shrink,
-            height: Length::Shrink,
+            width: Length::Fill,
+            height: Length::Fill,
             font: None,
             align_x: Alignment::Default,
             align_y: alignment::Vertical::Top,
@@ -83,6 +98,7 @@ where
             ellipsis: Ellipsis::default(),
             cursor_width: 2.0,
             nav_width,
+            scroll_anchor,
             class: Theme::default(),
         }
     }
@@ -98,20 +114,13 @@ where
     }
 }
 
-fn spans_total_len<Link, Font>(spans: &[Span<'_, Link, Font>]) -> usize {
-    spans.iter().map(|s| s.text.len()).sum()
-}
-
 fn gutter_width() -> f32 {
     64.0
 }
 
 /// A span restricted to a byte range of its own text, preserving every
 /// other attribute (style, link, ...).
-fn sub_span<'a, Link: Clone, Font: Clone>(
-    span: &Span<'a, Link, Font>,
-    range: Range<usize>,
-) -> Span<'a, Link, Font> {
+fn sub_span<'a, Font: Clone>(span: &Span<'a, (), Font>, range: Range<usize>) -> Span<'a, (), Font> {
     let text = match &span.text {
         Cow::Borrowed(s) => Cow::Borrowed(&s[range]),
         Cow::Owned(s) => Cow::Owned(s[range].to_string()),
@@ -126,9 +135,9 @@ fn sub_span<'a, Link: Clone, Font: Clone>(
 /// rope line today). Kept as a single seam: a future fold/conceal/virtual-text
 /// layer only needs to change what produces `(source_start, spans)` pairs,
 /// not the caching or layout code below.
-fn split_rows<'a, Link: Clone, Font: Clone>(
-    spans: &[Span<'a, Link, Font>],
-) -> Vec<(usize, Vec<Span<'a, Link, Font>>)> {
+fn split_rows<'a, Font: Clone>(
+    spans: &[Span<'a, (), Font>],
+) -> Vec<(usize, Vec<Span<'a, (), Font>>)> {
     let mut rows = Vec::new();
     let mut current = Vec::new();
     let mut row_start = 0usize;
@@ -156,7 +165,9 @@ fn split_rows<'a, Link: Clone, Font: Clone>(
     rows
 }
 
-fn row_key<Link, Font>(spans: &[Span<'_, Link, Font>]) -> String {
+/// Builds an owned row-text string. Only needed as a fallback when a row's
+/// spans can't be borrowed as one contiguous slice (see `row_text`).
+fn row_key<Font>(spans: &[Span<'_, (), Font>]) -> String {
     let mut s = String::new();
     for span in spans {
         s.push_str(&span.text);
@@ -164,10 +175,64 @@ fn row_key<Link, Font>(spans: &[Span<'_, Link, Font>]) -> String {
     s
 }
 
-impl<Link, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
-    for EditorParagraph<'_, Link, Theme, Renderer>
+/// The row's text as a `Cow`: zero-copy in the common case where a row fits
+/// entirely in one span (rope chunks are much larger than a typical line),
+/// falling back to an owned concatenation only when a row straddles a chunk
+/// boundary.
+fn row_text<'a, Font: Clone>(spans: &'a [Span<'_, (), Font>]) -> Cow<'a, str> {
+    match spans {
+        [single] => Cow::Borrowed(single.text.as_ref()),
+        _ => Cow::Owned(row_key(spans)),
+    }
+}
+
+/// The text already shaped and stored inside a cached `Paragraph`, reused as
+/// the cache's comparison key instead of keeping a second, redundant copy of
+/// every visible line.
+fn shaped_text<P: 'static>(paragraph: &P) -> Option<&str> {
+    let any: &dyn Any = paragraph as &dyn Any;
+    let gp = any.downcast_ref::<GraphicsParagraph>()?;
+    gp.buffer().lines.first().map(|line| line.text())
+}
+
+/// Extracts render rows for a window of the buffer, starting at `start_line`
+/// and covering at most `max_lines` logical lines (fewer near the end of the
+/// buffer). `source_start` in each row is an absolute byte offset into the
+/// whole buffer, so cursor lookups don't need to know where the window
+/// begins. Zero-copy: spans borrow directly from the rope's storage chunks.
+fn window_rows<'a, Font: Clone>(
+    buffer: &'a Rope,
+    start_line: usize,
+    max_lines: usize,
+) -> Vec<(usize, Vec<Span<'a, (), Font>>)> {
+    let n_lines = buffer.len_lines();
+    let start_line = start_line.min(n_lines.saturating_sub(1));
+    let end_line = (start_line + max_lines).min(n_lines);
+
+    let char_start = buffer.line_to_char(start_line);
+    let char_end = if end_line < n_lines {
+        buffer.line_to_char(end_line)
+    } else {
+        buffer.len_chars()
+    };
+    let byte_start = buffer.char_to_byte(char_start);
+
+    let slice = buffer.slice(char_start..char_end);
+    let spans: Vec<Span<'a, (), Font>> = slice
+        .chunks()
+        .filter(|c| !c.is_empty())
+        .map(|chunk| Span::new(Cow::Borrowed(chunk)))
+        .collect();
+
+    split_rows(&spans)
+        .into_iter()
+        .map(|(local, row_spans)| (byte_start + local, row_spans))
+        .collect()
+}
+
+impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
+    for EditorParagraph<'_, Theme, Renderer>
 where
-    Link: Clone + 'static,
     Renderer: text_advanced::Renderer + 'static,
     Renderer::Paragraph: Clone,
     Theme: Catalog,
@@ -177,7 +242,10 @@ where
     }
 
     fn state(&self) -> widget::tree::State {
-        widget::tree::State::new(State::<Renderer::Paragraph> { rows: Vec::new() })
+        widget::tree::State::new(State::<Renderer::Paragraph> {
+            rows: Vec::new(),
+            anchor_line: 0,
+        })
     }
 
     fn size(&self) -> Size<Length> {
@@ -194,13 +262,11 @@ where
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
-        let content = self.spans.as_ref().as_ref();
         let gutter = if self.show_line_numbers {
             gutter_width()
         } else {
             0.0
         };
-        let rows = split_rows(content);
 
         layout::sized(limits, self.width, self.height, |limits| {
             let bounds = limits.max();
@@ -225,25 +291,50 @@ where
                 hint_factor: renderer.scale_factor(),
             };
 
+            // Clamp the anchor: the buffer may have shrunk (deletions) since
+            // the last scroll.
+            let n_lines = self.buffer.len_lines();
+            let anchor_line = self.scroll_anchor.get().min(n_lines.saturating_sub(1));
+            self.scroll_anchor.set(anchor_line);
+
+            // Logical lines needed to *safely* cover the viewport height,
+            // assuming no wrapping. Wrapping only adds visual rows, so this
+            // is always a sufficient (if sometimes generous) slice.
+            let line_height_px = f32::from(self.line_height.to_absolute(size)).max(1.0);
+            let max_visible_lines = ((para_bounds.height / line_height_px).ceil() as usize).max(1);
+            let windowed =
+                window_rows::<Renderer::Font>(self.buffer, anchor_line, max_visible_lines + 2);
+
             // Index the previous frame's shaped rows by their text, so an
             // unchanged line reuses its paragraph (cheap Arc clone) instead
             // of being reshaped. Indexed by content, not position: inserting
             // or deleting a line shifts indices but not surviving rows' text.
+            // Rows that scrolled offscreen are simply never looked up again
+            // and drop here, which is exactly the eviction we want.
             let previous = std::mem::take(&mut state.rows);
             let mut by_key: HashMap<&str, usize> = HashMap::with_capacity(previous.len());
             for (i, row) in previous.iter().enumerate() {
-                by_key.entry(row.key.as_str()).or_insert(i);
+                if let Some(text) = shaped_text(&row.paragraph) {
+                    by_key.entry(text).or_insert(i);
+                }
             }
 
-            let mut new_rows = Vec::with_capacity(rows.len());
+            let mut new_rows = Vec::new();
             let mut y = 0.0f32;
             let mut width = 0.0f32;
 
-            for (source_start, row_spans) in &rows {
-                let key = row_key(row_spans);
+            for (source_start, row_spans) in &windowed {
+                // Stop shaping once the viewport is full: rows further down
+                // the window were only speculatively sliced from the rope,
+                // never touched, and cost nothing.
+                if y >= para_bounds.height {
+                    break;
+                }
+
+                let text = row_text(row_spans);
 
                 let cached = by_key
-                    .get(key.as_str())
+                    .get(text.as_ref())
                     .map(|&i| previous[i].paragraph.clone());
                 let (mut paragraph, mut needs_shape) = match cached {
                     Some(p) => (p, false),
@@ -279,9 +370,9 @@ where
                 let height = min_bounds.height;
 
                 new_rows.push(Row {
-                    key,
                     source_start: *source_start,
                     paragraph,
+                    text_len: text.len(),
                     y,
                     height,
                 });
@@ -289,9 +380,53 @@ where
             }
 
             state.rows = new_rows;
+            state.anchor_line = anchor_line;
 
-            Size::new(width + gutter, y)
+            bounds
         })
+    }
+
+    fn update(
+        &mut self,
+        _tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        shell: &mut Shell<'_, Message>,
+        _viewport: &Rectangle,
+    ) {
+        let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event else {
+            return;
+        };
+        if !cursor.is_over(layout.bounds()) {
+            return;
+        }
+
+        let size = self.size.unwrap_or_else(|| renderer.default_size());
+        let line_height_px = f32::from(self.line_height.to_absolute(size)).max(1.0);
+
+        // Matches the sign convention of `iced::widget::scrollable`: negate
+        // the raw wheel delta before applying it.
+        let delta_lines = match *delta {
+            mouse::ScrollDelta::Lines { y, .. } => -y * 3.0,
+            mouse::ScrollDelta::Pixels { y, .. } => -y / line_height_px,
+        };
+
+        if delta_lines != 0.0 {
+            let n_lines = self.buffer.len_lines();
+            let max_anchor = n_lines.saturating_sub(1) as isize;
+            let current = self.scroll_anchor.get() as isize;
+            let new_anchor = (current + delta_lines.round() as isize).clamp(0, max_anchor) as usize;
+
+            if new_anchor != self.scroll_anchor.get() {
+                self.scroll_anchor.set(new_anchor);
+                shell.invalidate_layout();
+                shell.request_redraw();
+            }
+        }
+
+        shell.capture_event();
     }
 
     fn draw(
@@ -307,19 +442,8 @@ where
         let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
         let appearance = theme.style(&self.class);
         let bounds = layout.bounds();
+        let anchor = bounds.anchor(bounds.size(), self.align_x, self.align_y);
 
-        let total_height = state.rows.last().map(|r| r.y + r.height).unwrap_or(0.0);
-        let total_width = state
-            .rows
-            .iter()
-            .fold(0.0f32, |w, r| w.max(r.paragraph.min_bounds().width));
-        let anchor = bounds.anchor(
-            Size::new(total_width, total_height),
-            self.align_x,
-            self.align_y,
-        );
-
-        let content = self.spans.as_ref().as_ref();
         let gutter = if self.show_line_numbers {
             gutter_width()
         } else {
@@ -333,7 +457,7 @@ where
         if self.show_line_numbers {
             for (i, row) in state.rows.iter().enumerate() {
                 let text = text_advanced::Text {
-                    content: format!("{}", i + 1),
+                    content: format!("{}", state.anchor_line + i + 1),
                     bounds: Size::new(gutter - 8.0, row.height),
                     size: self.size.unwrap_or_else(|| renderer.default_size()),
                     line_height: self.line_height,
@@ -365,9 +489,8 @@ where
             );
         }
 
-        let total = spans_total_len(content);
         if let Some(cursor) = self.cursor
-            && cursor <= total
+            && cursor <= self.buffer.len_bytes()
         {
             draw_cursor(
                 renderer,
@@ -381,18 +504,15 @@ where
     }
 }
 
-impl<'a, Link, Message, Theme, Renderer> From<EditorParagraph<'a, Link, Theme, Renderer>>
+impl<'a, Message, Theme, Renderer> From<EditorParagraph<'a, Theme, Renderer>>
     for Element<'a, Message, Theme, Renderer>
 where
-    Link: Clone + 'static,
     Message: 'a,
     Renderer: text_advanced::Renderer + 'static + 'a,
     Renderer::Paragraph: Clone,
     Theme: Catalog + 'a,
 {
-    fn from(
-        text: EditorParagraph<'a, Link, Theme, Renderer>,
-    ) -> Element<'a, Message, Theme, Renderer> {
+    fn from(text: EditorParagraph<'a, Theme, Renderer>) -> Element<'a, Message, Theme, Renderer> {
         Element::new(text)
     }
 }
@@ -405,6 +525,15 @@ fn draw_cursor<Renderer: text_advanced::Renderer>(
     color: Color,
     width: f32,
 ) {
+    let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+        return;
+    };
+    // Cursor is outside the currently rendered window (scrolled offscreen):
+    // simply don't draw it, rather than clamping to the nearest edge.
+    if cursor < first.source_start || cursor > last.source_start + last.text_len {
+        return;
+    }
+
     // Last row whose `source_start` is <= cursor.
     let row_idx = match rows.binary_search_by_key(&cursor, |r| r.source_start) {
         Ok(i) => i,
