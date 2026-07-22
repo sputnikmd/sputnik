@@ -609,6 +609,123 @@ mod tests {
         }
     }
 
+    /// Regression test for a real-app-only bug that the other snapshot
+    /// tests can't see: they all reuse one `iced_test::Simulator` (and thus
+    /// one long-lived `EditorParagraph` instance) across every layout pass,
+    /// but the real application calls `Editor::view()` fresh on *every*
+    /// redraw — including ones triggered by unrelated events like a plain
+    /// mouse move, which produce a no-op `Message` but still rebuild the
+    /// widget tree. Each such rebuild constructs a brand new
+    /// `EditorParagraph` whose `wheel_scrolled` field starts back at
+    /// `false`, and the old scroll-into-view check ran off nothing but that
+    /// field — so it fired on that unrelated rebuild too and snapped the
+    /// viewport back onto the cursor, undoing a wheel scroll the user just
+    /// made away from it.
+    ///
+    /// This drives `iced_runtime::UserInterface::build` directly (the same
+    /// primitive the real event loop uses) across three separate builds
+    /// sharing one retained `Cache`, so a fresh `EditorParagraph` really is
+    /// constructed each time, exactly like production.
+    #[test]
+    fn unrelated_relayout_does_not_snap_viewport_back_to_cursor_after_wheel_scroll() {
+        use iced::advanced::mouse;
+        use iced_test::core::renderer::Headless;
+        use iced_test::runtime::UserInterface;
+        use iced_test::runtime::user_interface::Cache;
+
+        let mut editor = Editor::<()>::new(Rope::from_str(""));
+        let mut text = String::new();
+        for i in 1..=50 {
+            text.push_str(&format!("line {i}\n"));
+        }
+        for ch in text.chars() {
+            editor.action(Action::Insert(ch));
+        }
+        // Cursor sits at the end of the 50-line document.
+
+        let size = iced::Size::new(200.0, 200.0);
+        let mut renderer = iced_test::futures::futures::executor::block_on(
+            <iced::Renderer as Headless>::new(iced_test::core::renderer::Settings::default(), None),
+        )
+        .expect("create headless renderer");
+        let no_cursor = mouse::Cursor::Unavailable;
+        // The wheel handler only reacts when the mouse is actually over the
+        // widget, so the frame that delivers the wheel event needs the
+        // cursor positioned inside its bounds.
+        let cursor_over_editor = mouse::Cursor::Available(iced::Point::new(50.0, 50.0));
+
+        // Frame 1: the very first `view()` build. Scroll-into-view has
+        // nothing to compare the cursor against yet, so it follows the
+        // cursor down to the end of the document.
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut interface = UserInterface::build(element, size, Cache::default(), &mut renderer);
+        interface.draw(
+            &mut renderer,
+            &iced::Theme::Light,
+            &Default::default(),
+            no_cursor,
+        );
+        let cache = interface.into_cache();
+
+        let (line_after_follow, _) = editor.scroll_anchor.get();
+        assert!(
+            line_after_follow > 0,
+            "should have followed the cursor down on the first layout"
+        );
+
+        // Frame 2: a fresh `view()` build (a new `EditorParagraph`,
+        // matching what every real redraw does), diffed against the
+        // retained `cache`. The user wheel-scrolls all the way back up,
+        // away from the cursor.
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut interface = UserInterface::build(element, size, cache, &mut renderer);
+        let mut messages = Vec::new();
+        let _ = interface.update(
+            &iced_test::core::window::Headless,
+            &iced_test::core::shell::Waker::noop(),
+            &[iced::Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1000.0 },
+            })],
+            cursor_over_editor,
+            &mut renderer,
+            &mut messages,
+        );
+        interface.draw(
+            &mut renderer,
+            &iced::Theme::Light,
+            &Default::default(),
+            cursor_over_editor,
+        );
+        let cache = interface.into_cache();
+
+        let (line_after_wheel, _) = editor.scroll_anchor.get();
+        assert_eq!(
+            line_after_wheel, 0,
+            "an overwhelming wheel-up should have scrolled all the way back to the top"
+        );
+
+        // Frame 3: another fresh `view()` build with no wheel event and no
+        // cursor movement — modeling the app rebuilding the widget tree in
+        // response to something unrelated (e.g. a mouse move producing a
+        // no-op `Message`). The viewport must stay exactly where the wheel
+        // left it, not jump back down to the cursor.
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut interface = UserInterface::build(element, size, cache, &mut renderer);
+        interface.draw(
+            &mut renderer,
+            &iced::Theme::Light,
+            &Default::default(),
+            no_cursor,
+        );
+
+        assert_eq!(
+            editor.scroll_anchor.get(),
+            (line_after_wheel, 0.0),
+            "an unrelated relayout must not snap the viewport back to the cursor \
+             after the user scrolled away from it"
+        );
+    }
+
     /// Moving the cursor with the keyboard past the bottom of the visible
     /// window should scroll the viewport to follow it, not leave it
     /// rendered off-screen.

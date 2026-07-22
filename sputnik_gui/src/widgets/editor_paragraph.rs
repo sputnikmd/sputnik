@@ -80,6 +80,15 @@ struct State<P> {
     /// The `scroll_anchor` value this frame's `rows` were built from, so
     /// `draw` can recover each row's line number.
     anchor_line: usize,
+    /// The cursor position as of the last `layout()` call. Persisted here
+    /// (rather than on the widget, which is rebuilt from scratch by `view()`
+    /// every frame) so scroll-into-view can tell "the cursor actually moved"
+    /// apart from "this is just another layout pass" — e.g. one triggered by
+    /// mouse movement elsewhere in the UI. Without this, every such pass
+    /// re-ran scroll-into-view unconditionally and yanked the viewport back
+    /// to the cursor even after the user had deliberately scrolled away from
+    /// it with the wheel or scrollbar.
+    last_cursor: Option<usize>,
 }
 
 impl<'a, Theme, Renderer> EditorParagraph<'a, Theme, Renderer>
@@ -338,6 +347,7 @@ where
         widget::tree::State::new(State::<Renderer::Paragraph> {
             rows: Vec::new(),
             anchor_line: 0,
+            last_cursor: None,
         })
     }
 
@@ -509,11 +519,18 @@ where
             let (mut new_rows, mut width) = shape_window(anchor_line, anchor_offset, &previous);
 
             // Scroll into view: only when the scroll was NOT user-initiated
-            // (mouse wheel). A wheel event already set the anchor exactly
-            // where the user wants it; overriding it here would fight the
-            // wheel and make scrolling impossible when the cursor is at a
-            // different position in the document.
+            // (mouse wheel) and the cursor actually moved since the last
+            // layout. A wheel event already set the anchor exactly where
+            // the user wants it; overriding it here would fight the wheel
+            // and make scrolling impossible when the cursor is at a
+            // different position in the document. Likewise, a layout pass
+            // triggered by something unrelated to the cursor (e.g. the
+            // mouse moving over some other part of the UI) must not force
+            // the viewport back onto a cursor the user never touched.
+            let cursor_moved = self.cursor != state.last_cursor;
+            state.last_cursor = self.cursor;
             if !self.wheel_scrolled
+                && cursor_moved
                 && let Some(cursor) = self.cursor
             {
                 let cursor_line = self
