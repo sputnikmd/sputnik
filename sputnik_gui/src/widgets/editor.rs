@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 
 use ropey::Rope;
@@ -42,8 +42,11 @@ pub struct Editor<Message> {
     /// as `nav_width`: the widget updates it on scroll.
     scroll_anchor: Cell<(usize, f32)>,
     /// Selected char range, `start..end` with `start <= end`. `None` means
-    /// no selection.
-    selection: Option<Range<usize>>,
+    /// no selection. Interior mutability for the same reason as `cursor`:
+    /// a mouse drag, handled inside the widget with only `&self`, needs to
+    /// update this directly. `RefCell` rather than `Cell` because `Range`
+    /// isn't `Copy`.
+    selection: RefCell<Option<Range<usize>>>,
     _phantom: std::marker::PhantomData<Message>,
 }
 
@@ -55,7 +58,7 @@ impl<Message> Editor<Message> {
             tab_size: 4,
             nav_width: Cell::new(800.0),
             scroll_anchor: Cell::new((0, 0.0)),
-            selection: None,
+            selection: RefCell::new(None),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -271,8 +274,8 @@ impl<Message> Editor<Message> {
         // An edit can shrink the buffer out from under a selection set
         // before it (e.g. deleting past what was selected): re-clamp rather
         // than let it go stale and panic on the next `char_to_byte`.
-        self.selection = self
-            .selection
+        let mut selection = self.selection.borrow_mut();
+        *selection = selection
             .take()
             .and_then(|range| clamp_selection(range.start, range.end, len));
     }
@@ -289,23 +292,19 @@ impl<Message> Editor<Message> {
     /// order. Out-of-bounds endpoints are clipped to the buffer's length;
     /// if that clipping collapses the range to empty, the selection is
     /// cleared instead of kept as a vacuous `Some(x..x)`.
-    ///
-    /// Not yet called from `Application` — no selection gesture (mouse drag,
-    /// shift+arrow) is wired up yet, only the widget-level rendering and
-    /// this API to drive it.
     #[allow(dead_code)]
     pub fn select(&mut self, a: usize, b: usize) {
-        self.selection = clamp_selection(a, b, self.buffer.len_chars());
+        *self.selection.borrow_mut() = clamp_selection(a, b, self.buffer.len_chars());
     }
 
     #[allow(dead_code)]
     pub fn clear_selection(&mut self) {
-        self.selection = None;
+        *self.selection.borrow_mut() = None;
     }
 
     #[allow(dead_code)]
     pub fn selection(&self) -> Option<Range<usize>> {
-        self.selection.clone()
+        self.selection.borrow().clone()
     }
 
     /// The current selection as a byte range, for the widget layer (which
@@ -316,8 +315,17 @@ impl<Message> Editor<Message> {
     /// line of defense before the only place that can actually panic
     /// (`char_to_byte` on an out-of-bounds char index), so it stays correct
     /// even if some future caller mutates `self.selection` directly.
+    ///
+    /// No longer called from `view()` — `EditorParagraph` now recomputes
+    /// the same thing itself, reading `selection_cell` live on every
+    /// `draw()` rather than from a value snapshotted once when the widget
+    /// was constructed (see `EditorParagraph::live_selection`). Kept here
+    /// as a test helper for exercising the same clamp logic against the
+    /// model directly.
+    #[allow(dead_code)]
     fn flat_selection(&self) -> Option<Range<usize>> {
-        let selection = self.selection.as_ref()?;
+        let selection = self.selection.borrow();
+        let selection = selection.as_ref()?;
         let len = self.buffer.len_chars();
         let range = clamp_selection(selection.start, selection.end, len)?;
         Some(self.buffer.char_to_byte(range.start)..self.buffer.char_to_byte(range.end))
@@ -326,14 +334,13 @@ impl<Message> Editor<Message> {
     pub fn view(&self) -> EditorParagraph<'_, iced::Theme, iced::Renderer> {
         EditorParagraph::new(
             &self.buffer,
-            Some(self.flat_cursor()),
             &self.nav_width,
             &self.scroll_anchor,
             &self.cursor,
+            &self.selection,
         )
         .size(FONT_SIZE)
         .show_line_numbers(true)
-        .selection(self.flat_selection())
     }
 }
 
@@ -606,6 +613,173 @@ mod tests {
             cursor - line_start,
             "world".len(),
             "a click past the end of a short line should clamp to that line's end"
+        );
+        assert_eq!(
+            editor.selection(),
+            None,
+            "a plain click with no drag should not create a selection"
+        );
+    }
+
+    /// Dragging the mouse from a press to a release should select the text
+    /// between the two points, following the pointer even as it moves
+    /// (rather than only reacting to the press and release themselves).
+    #[test]
+    fn drag_selects_text_between_press_and_release() {
+        let mut editor = Editor::<()>::new(Rope::from_str(""));
+        let text = "hello\nworld\n";
+        for ch in text.chars() {
+            editor.action(Action::Insert(ch));
+        }
+        for _ in 0..text.chars().count() {
+            editor.action(Action::MoveCursorLeft);
+        }
+        assert_eq!(editor.selection(), None, "no selection before any drag");
+
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(300.0, 200.0),
+            element,
+        );
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        // Press right at the start of "hello" (first row) ...
+        let start = iced_test::core::Point::new(2.0, 10.0);
+        ui.point_at(start);
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+            iced::mouse::Button::Left,
+        ))]);
+
+        // ... drag well past the end of "world" (second row) ...
+        let end = iced_test::core::Point::new(250.0, 45.0);
+        ui.point_at(end);
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: end,
+        })]);
+
+        // ... and release.
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+            iced::mouse::Button::Left,
+        ))]);
+
+        let selection = editor
+            .selection()
+            .expect("drag should have created a selection");
+        assert_eq!(
+            selection.start, 0,
+            "selection should start at the press point"
+        );
+
+        let line_start = editor.buffer.line_to_char(1);
+        assert_eq!(
+            selection.end,
+            line_start + "world".len(),
+            "selection should extend to the drag's end point, clamped to \"world\"'s end"
+        );
+
+        assert_eq!(
+            editor.cursor(),
+            selection.end,
+            "the cursor should follow the drag's end point"
+        );
+    }
+
+    /// Regression test for a real perceived-performance bug: a drag's
+    /// `CursorMoved` events are captured by the widget (correctly — see
+    /// `press_to_select`/`drag_extend_selection`), which means they never
+    /// produce a `Message` and so `Editor::view()` never reconstructs this
+    /// widget for the rest of the drag. `EditorParagraph` used to snapshot
+    /// the cursor/selection into plain fields once, at construction time;
+    /// with no rebuild happening mid-drag, the *rendered* highlight froze
+    /// at wherever the drag started even though the underlying model kept
+    /// updating correctly — which read as "selection is incredibly slow to
+    /// compute" (it wasn't slow, it just wasn't being redrawn). The fix
+    /// (`EditorParagraph::live_cursor`/`live_selection`) reads the shared
+    /// `cursor_cell`/`selection_cell` fresh on every `layout()`/`draw()`
+    /// call instead, the same way `scroll_anchor` already did.
+    ///
+    /// This test drives the *same* widget instance across the whole drag
+    /// (`iced_test::Simulator` never reconstructs it either), which is
+    /// exactly the real-world condition that exposed the bug, and compares
+    /// actual rendered pixels rather than only the model.
+    #[test]
+    fn drag_extend_redraws_the_live_selection_without_a_view_rebuild() {
+        let mut editor = Editor::<()>::new(Rope::from_str(""));
+        let text = "hello\nworld\n";
+        for ch in text.chars() {
+            editor.action(Action::Insert(ch));
+        }
+        for _ in 0..text.chars().count() {
+            editor.action(Action::MoveCursorLeft);
+        }
+
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(300.0, 200.0),
+            element,
+        );
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        let start = iced_test::core::Point::new(2.0, 10.0);
+        ui.point_at(start);
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+            iced::mouse::Button::Left,
+        ))]);
+
+        let mid = iced_test::core::Point::new(250.0, 10.0);
+        ui.point_at(mid);
+        let move_statuses = ui.simulate([iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: mid,
+        })]);
+        assert_eq!(
+            move_statuses,
+            vec![iced::event::Status::Captured],
+            "a CursorMoved during an active drag should be captured by the widget, \
+             not left for the app's own event subscription to turn into a Message"
+        );
+        let selection_after_first_move = editor.selection();
+        assert!(
+            selection_after_first_move.is_some(),
+            "model selection should be set as soon as the drag has moved"
+        );
+
+        let after_first_move = ui
+            .snapshot(&iced::Theme::Light)
+            .expect("snapshot should render");
+        let hash_path = std::env::temp_dir().join(format!(
+            "sputnik_drag_redraw_test_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(hash_path.with_extension("sha256"));
+        after_first_move
+            .matches_hash(&hash_path)
+            .expect("should save baseline hash");
+
+        let end = iced_test::core::Point::new(250.0, 45.0);
+        ui.point_at(end);
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: end,
+        })]);
+        assert_ne!(
+            selection_after_first_move,
+            editor.selection(),
+            "the model selection should differ between the two drag points"
+        );
+
+        let after_second_move = ui
+            .snapshot(&iced::Theme::Light)
+            .expect("snapshot should render");
+        let unchanged = after_second_move
+            .matches_hash(&hash_path)
+            .expect("should compare against the baseline hash");
+        let _ = std::fs::remove_file(hash_path.with_extension("sha256"));
+
+        assert!(
+            !unchanged,
+            "the rendered frame should change along with the model as the drag continues, \
+             but pixel bytes were identical to the previous frame — the highlight is frozen"
         );
     }
 

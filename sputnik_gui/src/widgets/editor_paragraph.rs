@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -24,10 +24,6 @@ where
 {
     buffer: &'a Rope,
     show_line_numbers: bool,
-    cursor: Option<usize>,
-    /// Selected byte range into the buffer, `start..end` with `start <=
-    /// end`. Rendered as a layer beneath the text.
-    selection: Option<Range<usize>>,
     size: Option<Pixels>,
     line_height: LineHeight,
     width: Length,
@@ -47,11 +43,26 @@ where
     /// what's already visible are ever shaped — while `offset` still gives
     /// smooth, pixel-precise scrolling within that.
     scroll_anchor: &'a Cell<(usize, f32)>,
-    /// The document's char-index cursor cell. Written directly by `update()`
-    /// on a left click — the same interior-mutability route `scroll_anchor`
-    /// uses, since this widget only ever gets `&self` access to the
-    /// `Editor` that owns it.
+    /// The document's char-index cursor cell — the single source of truth
+    /// for the cursor position, read fresh by `layout()`/`draw()` on every
+    /// call rather than cached in a field on this struct. Written directly
+    /// by `update()` on a left click, the same interior-mutability route
+    /// `scroll_anchor` uses, since this widget only ever gets `&self` access
+    /// to the `Editor` that owns it.
+    ///
+    /// This matters beyond symmetry with `scroll_anchor`: a captured event
+    /// (like a drag's `CursorMoved`) never produces a `Message`, so
+    /// `Editor::view()` never reconstructs this widget for the rest of the
+    /// drag — the *same* `EditorParagraph` instance keeps getting
+    /// `layout()`/`draw()` called on it. A cursor value cached in a field at
+    /// construction time would stay frozen at whatever it was when the drag
+    /// started; reading the cell fresh every call is what lets the render
+    /// keep tracking the drag in real time.
     cursor_cell: &'a Cell<usize>,
+    /// The document's char-range selection cell, for the same reason and in
+    /// the same way as `cursor_cell` — read fresh, not cached. `RefCell`
+    /// (not `Cell`, like `cursor_cell`) because `Range` isn't `Copy`.
+    selection_cell: &'a RefCell<Option<Range<usize>>>,
     /// Set by `update()` when a wheel event is processed. `layout()` reads
     /// it to decide whether the scroll was user-initiated (wheel) vs
     /// cursor-initiated (keyboard): only in the latter case should
@@ -94,6 +105,12 @@ struct State<P> {
     /// to the cursor even after the user had deliberately scrolled away from
     /// it with the wheel or scrollbar.
     last_cursor: Option<usize>,
+    /// The char index the mouse was over when the left button went down,
+    /// while the button is still held. `None` when not dragging. Persisted
+    /// here (not on the widget) for the same reason as `last_cursor`: it
+    /// must survive the widget being rebuilt from scratch on every frame
+    /// between the press and the eventual release.
+    drag_anchor: Option<usize>,
 }
 
 impl<'a, Theme, Renderer> EditorParagraph<'a, Theme, Renderer>
@@ -104,16 +121,14 @@ where
 {
     pub fn new(
         buffer: &'a Rope,
-        cursor: Option<usize>,
         nav_width: &'a Cell<f32>,
         scroll_anchor: &'a Cell<(usize, f32)>,
         cursor_cell: &'a Cell<usize>,
+        selection_cell: &'a RefCell<Option<Range<usize>>>,
     ) -> Self {
         Self {
             buffer,
             show_line_numbers: false,
-            cursor,
-            selection: None,
             size: None,
             line_height: LineHeight::default(),
             width: Length::Fill,
@@ -127,6 +142,7 @@ where
             nav_width,
             scroll_anchor,
             cursor_cell,
+            selection_cell,
             wheel_scrolled: false,
             class: Theme::default(),
         }
@@ -137,9 +153,27 @@ where
         self
     }
 
-    pub fn selection(mut self, selection: Option<Range<usize>>) -> Self {
-        self.selection = selection;
-        self
+    /// The current selection as a byte range, recomputed fresh from
+    /// `selection_cell` (a char range) every call — see that field's doc
+    /// comment for why this isn't cached. Re-clamps against the buffer's
+    /// current length for the same reason `Editor::flat_selection` does:
+    /// the last line of defense before the only place that can actually
+    /// panic on a stale, out-of-bounds range (`char_to_byte`).
+    fn live_selection(&self) -> Option<Range<usize>> {
+        let selection = self.selection_cell.borrow();
+        let selection = selection.as_ref()?;
+        let len = self.buffer.len_chars();
+        let (start, end) = (selection.start.min(len), selection.end.min(len));
+        let (start, end) = (start.min(end), start.max(end));
+        (start < end).then(|| self.buffer.char_to_byte(start)..self.buffer.char_to_byte(end))
+    }
+
+    /// The current cursor as a byte offset, recomputed fresh from
+    /// `cursor_cell` (a char index) every call — see that field's doc
+    /// comment for why this isn't cached.
+    fn live_cursor(&self) -> usize {
+        let char_idx = self.cursor_cell.get().min(self.buffer.len_chars());
+        self.buffer.char_to_byte(char_idx)
     }
 
     pub fn size(mut self, size: impl Into<Pixels>) -> Self {
@@ -355,6 +389,7 @@ where
             rows: Vec::new(),
             anchor_line: 0,
             last_cursor: None,
+            drag_anchor: None,
         })
     }
 
@@ -534,12 +569,10 @@ where
             // triggered by something unrelated to the cursor (e.g. the
             // mouse moving over some other part of the UI) must not force
             // the viewport back onto a cursor the user never touched.
-            let cursor_moved = self.cursor != state.last_cursor;
-            state.last_cursor = self.cursor;
-            if !self.wheel_scrolled
-                && cursor_moved
-                && let Some(cursor) = self.cursor
-            {
+            let cursor = self.live_cursor();
+            let cursor_moved = Some(cursor) != state.last_cursor;
+            state.last_cursor = Some(cursor);
+            if !self.wheel_scrolled && cursor_moved {
                 let cursor_line = self
                     .buffer
                     .byte_to_line(cursor.min(self.buffer.len_bytes()));
@@ -643,9 +676,25 @@ where
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
-        if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
-            click_to_cursor::<Message, Theme, Renderer>(self, tree, layout, cursor, shell);
-            return;
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                press_to_select::<Message, Theme, Renderer>(self, tree, layout, cursor, shell);
+                return;
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                drag_extend_selection::<Message, Theme, Renderer>(
+                    self, tree, layout, cursor, shell,
+                );
+                return;
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+                if state.drag_anchor.take().is_some() {
+                    shell.capture_event();
+                }
+                return;
+            }
+            _ => {}
         }
 
         let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event else {
@@ -774,8 +823,8 @@ where
         renderer.with_layer(clip, |renderer| {
             // Selection is its own layer beneath the gutter and the text:
             // drawn first, so everything else paints on top of it.
-            if let Some(selection) = &self.selection {
-                draw_selection(renderer, &state.rows, text_anchor, selection);
+            if let Some(selection) = self.live_selection() {
+                draw_selection(renderer, &state.rows, text_anchor, &selection);
             }
 
             // Draw line numbers in the gutter: one per row, at that row's top.
@@ -814,18 +863,14 @@ where
                 );
             }
 
-            if let Some(cursor) = self.cursor
-                && cursor <= self.buffer.len_bytes()
-            {
-                draw_cursor(
-                    renderer,
-                    &state.rows,
-                    text_anchor,
-                    cursor,
-                    color,
-                    self.cursor_width,
-                );
-            }
+            draw_cursor(
+                renderer,
+                &state.rows,
+                text_anchor,
+                self.live_cursor(),
+                color,
+                self.cursor_width,
+            );
 
             let (_, anchor_offset) = self.scroll_anchor.get();
             draw_scrollbar(
@@ -1077,13 +1122,47 @@ fn cursor_pos_in_row(
     Some((0.0, 0.0, lh))
 }
 
-/// Moves the cursor to wherever the user just left-clicked, hit-testing
-/// against the rows the last `layout()` pass already shaped (from
-/// `tree.state`) rather than reshaping anything. Writes straight into
-/// `cursor_cell` — the same interior-mutability route `scroll_anchor` uses,
-/// since the widget only ever gets `&self` access to the `Editor` that owns
-/// it — so this only needs `&EditorParagraph`, not `&mut`.
-fn click_to_cursor<Message, Theme, Renderer>(
+/// Converts a point (in the same coordinate space as `layout.bounds()`) to
+/// the char index nearest it, hit-testing against the rows the last
+/// `layout()` pass already shaped (from `tree.state`) rather than reshaping
+/// anything.
+fn point_to_char<Theme, Renderer>(
+    widget: &EditorParagraph<'_, Theme, Renderer>,
+    tree: &Tree,
+    layout: Layout<'_>,
+    point: Point,
+) -> Option<usize>
+where
+    Renderer: text_advanced::Renderer + 'static,
+    Renderer::Paragraph: Clone,
+    Theme: Catalog,
+{
+    let bounds = layout.bounds();
+    let anchor = bounds.anchor(bounds.size(), widget.align_x, widget.align_y);
+    let gutter = if widget.show_line_numbers {
+        gutter_width()
+    } else {
+        0.0
+    };
+    let text_anchor = Point::new(anchor.x + gutter, anchor.y);
+
+    let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
+    let byte = hit_test::<Renderer>(&state.rows, text_anchor, point)?;
+    Some(
+        widget
+            .buffer
+            .byte_to_char(byte.min(widget.buffer.len_bytes())),
+    )
+}
+
+/// Moves the cursor to wherever the user just left-clicked, clears any
+/// existing selection, and records the click's char index as the drag
+/// anchor so a subsequent drag (see `drag_extend_selection`) knows where the
+/// selection should start from. Writes straight into `cursor_cell`/
+/// `selection_cell` — the same interior-mutability route `scroll_anchor`
+/// uses, since the widget only ever gets `&self` access to the `Editor`
+/// that owns it — so this only needs `&EditorParagraph`, not `&mut`.
+fn press_to_select<Message, Theme, Renderer>(
     widget: &EditorParagraph<'_, Theme, Renderer>,
     tree: &mut Tree,
     layout: Layout<'_>,
@@ -1097,26 +1176,68 @@ fn click_to_cursor<Message, Theme, Renderer>(
     let Some(point) = cursor.position_over(layout.bounds()) else {
         return;
     };
-
-    let bounds = layout.bounds();
-    let anchor = bounds.anchor(bounds.size(), widget.align_x, widget.align_y);
-    let gutter = if widget.show_line_numbers {
-        gutter_width()
-    } else {
-        0.0
+    let Some(char_idx) = point_to_char(widget, tree, layout, point) else {
+        return;
     };
-    let text_anchor = Point::new(anchor.x + gutter, anchor.y);
 
+    if char_idx != widget.cursor_cell.get() {
+        widget.cursor_cell.set(char_idx);
+        shell.invalidate_layout();
+        shell.request_redraw();
+    }
+    if widget.selection_cell.borrow().is_some() {
+        *widget.selection_cell.borrow_mut() = None;
+        shell.invalidate_layout();
+        shell.request_redraw();
+    }
+
+    let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+    state.drag_anchor = Some(char_idx);
+
+    shell.capture_event();
+}
+
+/// Extends the selection from the drag anchor (set by `press_to_select`) to
+/// wherever the pointer has moved, following it even past the widget's own
+/// bounds — a drag commonly overshoots the editor while selecting, and the
+/// selection should keep tracking the pointer rather than stall at the
+/// edge. A no-op (and doesn't capture the event) when no drag is in
+/// progress, so plain hover movement isn't swallowed.
+fn drag_extend_selection<Message, Theme, Renderer>(
+    widget: &EditorParagraph<'_, Theme, Renderer>,
+    tree: &mut Tree,
+    layout: Layout<'_>,
+    cursor: mouse::Cursor,
+    shell: &mut Shell<'_, Message>,
+) where
+    Renderer: text_advanced::Renderer + 'static,
+    Renderer::Paragraph: Clone,
+    Theme: Catalog,
+{
     let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
-    if let Some(byte) = hit_test::<Renderer>(&state.rows, text_anchor, point) {
-        let char_idx = widget
-            .buffer
-            .byte_to_char(byte.min(widget.buffer.len_bytes()));
-        if char_idx != widget.cursor_cell.get() {
-            widget.cursor_cell.set(char_idx);
-            shell.invalidate_layout();
-            shell.request_redraw();
-        }
+    let Some(anchor_char) = state.drag_anchor else {
+        return;
+    };
+    let Some(point) = cursor.position() else {
+        return;
+    };
+    let Some(target_char) = point_to_char(widget, tree, layout, point) else {
+        return;
+    };
+
+    let len = widget.buffer.len_chars();
+    let (start, end) = (anchor_char.min(target_char), anchor_char.max(target_char));
+    let new_selection = (start.min(len) < end.min(len)).then(|| start.min(len)..end.min(len));
+
+    if *widget.selection_cell.borrow() != new_selection {
+        *widget.selection_cell.borrow_mut() = new_selection;
+        shell.invalidate_layout();
+        shell.request_redraw();
+    }
+    if widget.cursor_cell.get() != target_char {
+        widget.cursor_cell.set(target_char);
+        shell.invalidate_layout();
+        shell.request_redraw();
     }
 
     shell.capture_event();
@@ -1173,11 +1294,17 @@ mod tests {
         let nav_width = Cell::new(800.0);
         let scroll_anchor = Cell::new((0usize, 0.0f32));
         let cursor_cell = Cell::new(0usize);
+        let selection_cell = RefCell::new(None);
 
-        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
-            EditorParagraph::new(&buffer, None, &nav_width, &scroll_anchor, &cursor_cell)
-                .size(24.0)
-                .into();
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = EditorParagraph::new(
+            &buffer,
+            &nav_width,
+            &scroll_anchor,
+            &cursor_cell,
+            &selection_cell,
+        )
+        .size(24.0)
+        .into();
 
         let mut ui = iced_test::Simulator::with_size(
             iced_test::core::Settings::default(),
@@ -1221,11 +1348,17 @@ mod tests {
         let nav_width = Cell::new(800.0);
         let scroll_anchor = Cell::new((0usize, 0.0f32));
         let cursor_cell = Cell::new(0usize);
+        let selection_cell = RefCell::new(None);
 
-        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
-            EditorParagraph::new(&buffer, None, &nav_width, &scroll_anchor, &cursor_cell)
-                .size(24.0)
-                .into();
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = EditorParagraph::new(
+            &buffer,
+            &nav_width,
+            &scroll_anchor,
+            &cursor_cell,
+            &selection_cell,
+        )
+        .size(24.0)
+        .into();
 
         let mut ui = iced_test::Simulator::with_size(
             iced_test::core::Settings::default(),
@@ -1289,11 +1422,17 @@ mod tests {
         let nav_width = Cell::new(100.0);
         let scroll_anchor = Cell::new((0usize, 0.0f32));
         let cursor_cell = Cell::new(0usize);
+        let selection_cell = RefCell::new(None);
 
-        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
-            EditorParagraph::new(&buffer, None, &nav_width, &scroll_anchor, &cursor_cell)
-                .size(24.0)
-                .into();
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = EditorParagraph::new(
+            &buffer,
+            &nav_width,
+            &scroll_anchor,
+            &cursor_cell,
+            &selection_cell,
+        )
+        .size(24.0)
+        .into();
 
         // Narrow viewport forces `long_line` to wrap into multiple visual
         // lines instead of fitting on one.
