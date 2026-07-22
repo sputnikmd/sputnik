@@ -24,10 +24,10 @@ pub struct Editor<Message> {
     /// Wrapping width for visual navigation. Interior mutability so callers
     /// with only `&self` can update it after layout.
     nav_width: Cell<f32>,
-    /// Topmost visible logical line. Interior mutability for the same
-    /// reason as `nav_width`: the widget updates it on scroll, `Editor`
-    /// reads it for keyboard-driven navigation.
-    scroll_anchor: Cell<usize>,
+    /// Topmost visible logical line, plus how many pixels of that line are
+    /// scrolled above the viewport. Interior mutability for the same reason
+    /// as `nav_width`: the widget updates it on scroll.
+    scroll_anchor: Cell<(usize, f32)>,
     _phantom: std::marker::PhantomData<Message>,
 }
 
@@ -38,7 +38,7 @@ impl<Message> Editor<Message> {
             cursor: 0,
             tab_size: 4,
             nav_width: Cell::new(800.0),
-            scroll_anchor: Cell::new(0),
+            scroll_anchor: Cell::new((0, 0.0)),
             _phantom: std::marker::PhantomData,
         }
     }

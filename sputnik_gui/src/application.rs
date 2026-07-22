@@ -5,7 +5,7 @@ use iced::event::{self, Event};
 use iced::keyboard;
 use iced::keyboard::Key;
 use iced::keyboard::key::Named;
-use iced::widget::{column, container, space, stack, text};
+use iced::widget::{column, container, text};
 use iced::{Element, Length, Subscription, Task};
 use ropey::Rope;
 
@@ -130,13 +130,17 @@ impl Application {
         .color(iced::color!(0x666666))
         .into();
 
+        // Siblings in a column, not layers in a stack: a stack would give
+        // the editor and the HUD the *same* bounds, so the editor's own
+        // viewport height would legitimately extend under the HUD's row
+        // (that's overlap by shared bounds, not overflow — clipping the
+        // editor to its own bounds wouldn't change anything). As column
+        // siblings, the editor's `Fill` height excludes the HUD's `Shrink`
+        // row instead.
         container(
-            stack([
-                self.editor.view().into(),
-                column![space::vertical(), hud].into(),
-            ])
-            .width(Length::Fill)
-            .height(Length::Fill),
+            column![self.editor.view(), hud]
+                .width(Length::Fill)
+                .height(Length::Fill),
         )
         .padding(32.0)
         .into()

@@ -36,11 +36,14 @@ where
     ellipsis: Ellipsis,
     cursor_width: f32,
     nav_width: &'a Cell<f32>,
-    /// Index of the topmost logical line currently rendered. Scrolling
-    /// moves this by whole lines instead of pixels, so the "how tall is an
-    /// offscreen row" problem never comes up: only rows adjacent to what's
-    /// already visible are ever shaped.
-    scroll_anchor: &'a Cell<usize>,
+    /// `(line, offset)`: index of the topmost logical line currently
+    /// rendered, plus how many pixels of that line are scrolled above the
+    /// viewport (`0.0 <= offset < that line's rendered height`). Anchoring
+    /// to a line rather than an absolute pixel position means the "how tall
+    /// is an offscreen row" problem never comes up — only rows adjacent to
+    /// what's already visible are ever shaped — while `offset` still gives
+    /// smooth, pixel-precise scrolling within that.
+    scroll_anchor: &'a Cell<(usize, f32)>,
     class: Theme::Class<'a>,
 }
 
@@ -81,7 +84,7 @@ where
         buffer: &'a Rope,
         cursor: Option<usize>,
         nav_width: &'a Cell<f32>,
-        scroll_anchor: &'a Cell<usize>,
+        scroll_anchor: &'a Cell<(usize, f32)>,
     ) -> Self {
         Self {
             buffer,
@@ -294,8 +297,12 @@ where
             // Clamp the anchor: the buffer may have shrunk (deletions) since
             // the last scroll.
             let n_lines = self.buffer.len_lines();
-            let anchor_line = self.scroll_anchor.get().min(n_lines.saturating_sub(1));
-            self.scroll_anchor.set(anchor_line);
+            let (mut anchor_line, mut anchor_offset) = self.scroll_anchor.get();
+            anchor_line = anchor_line.min(n_lines.saturating_sub(1));
+            if n_lines == 0 {
+                anchor_offset = 0.0;
+            }
+            self.scroll_anchor.set((anchor_line, anchor_offset));
 
             // Logical lines needed to *safely* cover the viewport height,
             // assuming no wrapping. Wrapping only adds visual rows, so this
@@ -320,7 +327,9 @@ where
             }
 
             let mut new_rows = Vec::new();
-            let mut y = 0.0f32;
+            // The anchor row starts partially above the viewport when
+            // `anchor_offset > 0`; it (and only it) gets clipped at the top.
+            let mut y = -anchor_offset;
             let mut width = 0.0f32;
 
             for (source_start, row_spans) in &windowed {
@@ -388,7 +397,7 @@ where
 
     fn update(
         &mut self,
-        _tree: &mut Tree,
+        tree: &mut Tree,
         event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
@@ -407,18 +416,60 @@ where
         let line_height_px = f32::from(self.line_height.to_absolute(size)).max(1.0);
 
         // Matches the sign convention of `iced::widget::scrollable`: negate
-        // the raw wheel delta before applying it.
-        let delta_lines = match *delta {
-            mouse::ScrollDelta::Lines { y, .. } => -y * 3.0,
-            mouse::ScrollDelta::Pixels { y, .. } => -y / line_height_px,
+        // the raw wheel delta before applying it. `Lines` deltas are turned
+        // into an equivalent pixel distance so both delta kinds share one
+        // accumulation path below. Accumulating in pixels (rather than
+        // rounding each event to whole lines) matters beyond smoothness:
+        // touchpads/high-res mice under libinput send many small `Pixels`
+        // events per gesture, each well under one line — rounding those to
+        // the nearest line individually discarded almost every event.
+        let delta_px = match *delta {
+            mouse::ScrollDelta::Lines { y, .. } => -y * line_height_px * 3.0,
+            mouse::ScrollDelta::Pixels { y, .. } => -y,
         };
 
-        if delta_lines != 0.0 {
+        if delta_px != 0.0 {
             let n_lines = self.buffer.len_lines();
-            let max_anchor = n_lines.saturating_sub(1) as isize;
-            let current = self.scroll_anchor.get() as isize;
-            let new_anchor = (current + delta_lines.round() as isize).clamp(0, max_anchor) as usize;
+            let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
 
+            // Prefer a row's actual shaped height when it's part of what's
+            // currently on screen; anything further out (a fast fling past
+            // the visible window) falls back to the no-wrap estimate rather
+            // than shaping offscreen rows just to scroll past them.
+            let height_of = |line: usize| -> f32 {
+                line.checked_sub(state.anchor_line)
+                    .and_then(|i| state.rows.get(i))
+                    .map(|row| row.height)
+                    .unwrap_or(line_height_px)
+            };
+
+            let (mut line, mut offset) = self.scroll_anchor.get();
+            offset += delta_px;
+
+            while offset < 0.0 {
+                if line == 0 {
+                    offset = 0.0;
+                    break;
+                }
+                line -= 1;
+                offset += height_of(line);
+            }
+            while offset >= 0.0 {
+                let h = height_of(line);
+                if line + 1 >= n_lines {
+                    // Nothing more to scroll into: bound the overscroll to
+                    // one line's worth instead of growing without limit.
+                    offset = offset.min(h);
+                    break;
+                }
+                if offset < h {
+                    break;
+                }
+                offset -= h;
+                line += 1;
+            }
+
+            let new_anchor = (line, offset);
             if new_anchor != self.scroll_anchor.get() {
                 self.scroll_anchor.set(new_anchor);
                 shell.invalidate_layout();
@@ -501,7 +552,77 @@ where
                 self.cursor_width,
             );
         }
+
+        draw_scrollbar(
+            renderer,
+            bounds,
+            state.rows.len(),
+            self.buffer.len_lines(),
+            state.anchor_line,
+        );
     }
+}
+
+const SCROLLBAR_WIDTH: f32 = 6.0;
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
+/// A minimal position/proportion indicator on the right edge, not a
+/// scrollable control (not yet interactive). Sized and positioned purely
+/// from line *counts* (visible rows vs. total lines), never from total
+/// document height, so it costs nothing beyond what's already shaped for
+/// virtualization.
+fn draw_scrollbar<Renderer: renderer::Renderer>(
+    renderer: &mut Renderer,
+    bounds: Rectangle,
+    visible_rows: usize,
+    n_lines: usize,
+    anchor_line: usize,
+) {
+    if n_lines == 0 || visible_rows >= n_lines {
+        return;
+    }
+
+    let track_height = bounds.height;
+    let thumb_height = (track_height * visible_rows as f32 / n_lines as f32)
+        .max(SCROLLBAR_MIN_THUMB)
+        .min(track_height);
+
+    let max_scroll_lines = (n_lines - visible_rows).max(1) as f32;
+    let scroll_fraction = (anchor_line as f32 / max_scroll_lines).clamp(0.0, 1.0);
+    let thumb_y = bounds.y + scroll_fraction * (track_height - thumb_height);
+    let track_x = bounds.x + bounds.width - SCROLLBAR_WIDTH;
+
+    renderer.fill_quad(
+        Quad {
+            bounds: Rectangle {
+                x: track_x,
+                y: bounds.y,
+                width: SCROLLBAR_WIDTH,
+                height: track_height,
+            },
+            border: iced::Border::default(),
+            shadow: iced::Shadow::default(),
+            snap: false,
+        },
+        Background::Color(Color::from_rgba(0.5, 0.5, 0.5, 0.08)),
+    );
+    renderer.fill_quad(
+        Quad {
+            bounds: Rectangle {
+                x: track_x,
+                y: thumb_y,
+                width: SCROLLBAR_WIDTH,
+                height: thumb_height,
+            },
+            border: iced::Border {
+                radius: (SCROLLBAR_WIDTH / 2.0).into(),
+                ..iced::Border::default()
+            },
+            shadow: iced::Shadow::default(),
+            snap: false,
+        },
+        Background::Color(Color::from_rgba(0.5, 0.5, 0.5, 0.4)),
+    );
 }
 
 impl<'a, Message, Theme, Renderer> From<EditorParagraph<'a, Theme, Renderer>>
@@ -590,4 +711,58 @@ fn cursor_pos_in_row(
 
     let lh = (buffer.metrics().line_height + 1.0) / hint;
     Some((0.0, 0.0, lh))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the wheel-scroll responsiveness bug: touchpads
+    /// and high-res mice under libinput/Wayland send many `Pixels` deltas
+    /// per gesture, each well under one line's height. Rounding each event
+    /// to the nearest line individually (the old behavior) discarded almost
+    /// all of them. Accumulating in pixels before converting to a line
+    /// should still move the anchor once enough of them land.
+    #[test]
+    fn pixel_wheel_scroll_accumulates_small_deltas() {
+        let mut text = String::new();
+        for i in 1..=50 {
+            text.push_str(&format!("line {i}\n"));
+        }
+        let buffer = Rope::from_str(&text);
+        let nav_width = Cell::new(800.0);
+        let scroll_anchor = Cell::new((0usize, 0.0f32));
+
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
+            EditorParagraph::new(&buffer, None, &nav_width, &scroll_anchor)
+                .size(24.0)
+                .into();
+
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(200.0, 200.0),
+            element,
+        );
+        ui.point_at(iced_test::core::Point::new(50.0, 50.0));
+        // Force an initial layout so `update` has shaped rows to read
+        // heights back from.
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        // 20 events of 5px each = 100px total, well over one line height
+        // (~31px at size 24), but each single event is far under half a
+        // line, so the old `.round()`-per-event logic would drop every one.
+        // Negative `y` scrolls down (see the sign convention note above).
+        for _ in 0..20 {
+            ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -5.0 },
+            })]);
+        }
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        let (line, offset) = scroll_anchor.get();
+        assert!(
+            line > 0 || offset > 0.0,
+            "20 events of 5px each should move the anchor, got (line={line}, offset={offset})"
+        );
+    }
 }
