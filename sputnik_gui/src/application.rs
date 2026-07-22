@@ -1,3 +1,6 @@
+use std::io;
+use std::sync::Arc;
+
 use iced::event::{self, Event};
 use iced::keyboard;
 use iced::keyboard::Key;
@@ -6,15 +9,25 @@ use iced::widget::{column, container, space, stack, text};
 use iced::{Element, Length, Subscription, Task};
 use ropey::Rope;
 
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use crate::APP_ICON;
 use crate::message::{self, Message};
 use crate::widgets::{Action, Editor};
 
+/// File opened on startup. Hardcoded for now — there's no file picker yet.
+const INITIAL_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../README.md");
+
 pub struct Application {
     window_id: iced::window::Id,
     editor: Editor<Message>,
+}
+
+async fn load_file(path: &'static str) -> Result<Arc<String>, io::ErrorKind> {
+    tokio::fs::read_to_string(path)
+        .await
+        .map(Arc::new)
+        .map_err(|err| err.kind())
 }
 
 impl Application {
@@ -30,16 +43,13 @@ impl Application {
         let tasks = vec![
             open_main_window
                 .map(|_| Message::Window(message::WindowMessage::InitializedMainWindow)),
+            Task::perform(load_file(INITIAL_FILE), Message::FileOpened),
         ];
-
-        let content = Rope::from_str(
-            "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed \ndo eiusmod tempor incididunt ut labore et dolore magna aliqua",
-        );
 
         (
             Self {
                 window_id: main_window_id,
-                editor: Editor::<Message>::new(content),
+                editor: Editor::<Message>::new(Rope::new()),
             },
             Task::batch(tasks),
         )
@@ -97,6 +107,13 @@ impl Application {
                 }
             },
 
+            Message::FileOpened(Ok(content)) => {
+                self.editor = Editor::new(Rope::from_str(&content));
+            }
+            Message::FileOpened(Err(err)) => {
+                error!("Failed to open {INITIAL_FILE}: {err:?}");
+            }
+
             Message::None => {}
         }
 
@@ -148,5 +165,27 @@ impl Application {
         ];
 
         Subscription::batch(tasks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initial_file_loads_real_content() {
+        let content = load_file(INITIAL_FILE)
+            .await
+            .expect("README.md should load");
+        assert!(!content.is_empty());
+
+        let expected = std::fs::read_to_string(INITIAL_FILE).expect("README.md should exist");
+        assert_eq!(*content, expected);
+    }
+
+    #[tokio::test]
+    async fn missing_file_returns_an_error() {
+        let result = load_file("/nonexistent/path/for/sputnik-test.txt").await;
+        assert!(result.is_err());
     }
 }

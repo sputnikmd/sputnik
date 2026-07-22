@@ -1,3 +1,6 @@
+use std::io;
+use std::sync::Arc;
+
 use iced::keyboard::Key;
 
 #[derive(Debug, Clone)]
@@ -7,6 +10,7 @@ pub enum Message {
         key: Key,
         text: Option<smol_str::SmolStr>,
     },
+    FileOpened(Result<Arc<String>, io::ErrorKind>),
     None,
 }
 
