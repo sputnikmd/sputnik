@@ -43,7 +43,7 @@ impl Application {
                 .map(|_| Message::Window(message::WindowMessage::InitializedMainWindow)),
         ];
         if let Some(path) = file {
-            tasks.push(Task::perform(load_file(path), Message::FileOpened));
+            tasks.push(Task::done(Message::OpenFile(path)));
         }
 
         (
@@ -106,6 +106,10 @@ impl Application {
                     }
                 }
             },
+
+            Message::OpenFile(path) => {
+                return Task::perform(load_file(path), Message::FileOpened);
+            }
 
             Message::FileOpened(Ok(content)) => {
                 self.editor = Editor::new(Rope::from_str(&content));

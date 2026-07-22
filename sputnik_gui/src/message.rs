@@ -11,6 +11,7 @@ pub enum Message {
         key: Key,
         text: Option<smol_str::SmolStr>,
     },
+    OpenFile(PathBuf),
     FileOpened(Result<Arc<String>, (PathBuf, io::ErrorKind)>),
     None,
 }
