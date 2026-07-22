@@ -248,6 +248,81 @@ fn window_rows<'a, Font: Clone>(
         .collect()
 }
 
+/// Walks `(line, offset)` forward or backward by `delta_px` pixels of
+/// scroll, using `height_of` for each line's true (wrap-aware) rendered
+/// height. Positive `delta_px` scrolls down, negative scrolls up. Shared by
+/// wheel-scroll and cursor-follow so a pixel of scroll means the same thing
+/// to both, even across a wrapped row's true multi-visual-line height.
+fn scroll_by(
+    mut line: usize,
+    offset: f32,
+    delta_px: f32,
+    n_lines: usize,
+    viewport_height: f32,
+    height_of: impl Fn(usize) -> f32,
+) -> (usize, f32) {
+    let mut offset = offset + delta_px;
+
+    while offset < 0.0 {
+        if line == 0 {
+            offset = 0.0;
+            break;
+        }
+        line -= 1;
+        offset += height_of(line);
+    }
+    while offset >= 0.0 {
+        let h = height_of(line);
+        if line + 1 >= n_lines {
+            // No further line to scroll into — but if this (possibly
+            // wrapped) last line is itself taller than the viewport,
+            // there's still more of *it* to reveal below what's currently
+            // at the top, up to its own bottom.
+            offset = offset.clamp(0.0, (h - viewport_height).max(0.0));
+            break;
+        }
+        if offset < h {
+            break;
+        }
+        offset -= h;
+        line += 1;
+    }
+
+    (line, offset)
+}
+
+/// Shapes a single logical line in isolation to measure its true rendered
+/// (wrap-aware) height, for scroll math that needs a line's height when
+/// it's not among whatever's already shaped nearby.
+fn measure_line_height<Renderer>(
+    buffer: &Rope,
+    line: usize,
+    template: text_advanced::Text<(), Renderer::Font>,
+) -> Option<f32>
+where
+    Renderer: text_advanced::Renderer,
+{
+    window_rows::<Renderer::Font>(buffer, line, 1)
+        .first()
+        .map(|(_, spans)| {
+            Renderer::Paragraph::with_spans(text_advanced::Text {
+                content: spans.as_slice(),
+                bounds: template.bounds,
+                size: template.size,
+                line_height: template.line_height,
+                font: template.font,
+                align_x: template.align_x,
+                align_y: template.align_y,
+                shaping: template.shaping,
+                wrapping: template.wrapping,
+                ellipsis: template.ellipsis,
+                hint_factor: template.hint_factor,
+            })
+            .min_bounds()
+            .height
+        })
+}
+
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
     for EditorParagraph<'_, Theme, Renderer>
 where
@@ -441,30 +516,91 @@ where
             // where the user wants it; overriding it here would fight the
             // wheel and make scrolling impossible when the cursor is at a
             // different position in the document.
-            if !self.wheel_scrolled {
-                if let Some(cursor) = self.cursor {
-                    let cursor_line = self
-                        .buffer
-                        .byte_to_line(cursor.min(self.buffer.len_bytes()));
+            if !self.wheel_scrolled
+                && let Some(cursor) = self.cursor
+            {
+                let cursor_line = self
+                    .buffer
+                    .byte_to_line(cursor.min(self.buffer.len_bytes()));
 
-                    if cursor_line < anchor_line {
-                        anchor_line = cursor_line;
-                        anchor_offset = 0.0;
-                        (new_rows, width) =
-                            shape_window(anchor_line, anchor_offset, &new_rows);
-                    } else if cursor_line >= anchor_line + new_rows.len() {
-                        // Bring the cursor's line to the bottom of the window
-                        // rather than snapping it to the top: a minimal scroll,
-                        // not an overshoot.
-                        anchor_line = cursor_line
-                            .saturating_sub(new_rows.len().saturating_sub(1));
-                        anchor_offset = 0.0;
-                        (new_rows, width) =
-                            shape_window(anchor_line, anchor_offset, &new_rows);
-                    }
-
-                    self.scroll_anchor.set((anchor_line, anchor_offset));
+                // Coarse jump: get the cursor's logical line roughly into
+                // the shaped window. This is a row-count estimate
+                // (imprecise once rows wrap to different heights) — the
+                // pixel-precise pass below corrects any remaining error, so
+                // it only needs to be close.
+                if cursor_line < anchor_line {
+                    anchor_line = cursor_line;
+                    anchor_offset = 0.0;
+                    (new_rows, width) = shape_window(anchor_line, anchor_offset, &new_rows);
+                } else if cursor_line >= anchor_line + new_rows.len() {
+                    anchor_line = cursor_line.saturating_sub(new_rows.len().saturating_sub(1));
+                    anchor_offset = 0.0;
+                    (new_rows, width) = shape_window(anchor_line, anchor_offset, &new_rows);
                 }
+
+                let mut cursor_idx = cursor_line
+                    .checked_sub(anchor_line)
+                    .filter(|&i| i < new_rows.len());
+
+                // The coarse jump above reasons in row counts, so a window
+                // of rows that wrap to unusual heights can still leave the
+                // cursor's row just outside it. Force it in directly before
+                // the pixel-precise pass.
+                if cursor_idx.is_none() {
+                    anchor_line = cursor_line;
+                    anchor_offset = 0.0;
+                    (new_rows, width) = shape_window(anchor_line, anchor_offset, &new_rows);
+                    cursor_idx = Some(0);
+                }
+
+                // Pixel-precise pass: make sure the cursor's own row is
+                // *fully* visible, not merely "the right logical line
+                // landed somewhere in the shaped window". Catches a wrapped
+                // row that's taller than the row-count estimate accounted
+                // for, a row that grew past the bottom edge mid-keystroke
+                // as it wrapped further while typing, and a row left
+                // straddling the top or bottom edge from a previous wheel
+                // scroll or a buffer edit elsewhere.
+                if let Some(idx) = cursor_idx {
+                    let row = &new_rows[idx];
+                    let row_top = row.y;
+                    let row_bottom = row.y + row.height;
+
+                    // Only the anchor row (index 0) can ever start above
+                    // the viewport: every later row's `y` is the running
+                    // sum of preceding rows' true heights, so it's never
+                    // negative.
+                    let correction = if row_top < 0.0 {
+                        row_top
+                    } else if row_bottom > para_bounds.height {
+                        row_bottom - para_bounds.height
+                    } else {
+                        0.0
+                    };
+
+                    if correction != 0.0 {
+                        let height_of = |line: usize| -> f32 {
+                            line.checked_sub(anchor_line)
+                                .and_then(|i| new_rows.get(i))
+                                .map(|r| r.height)
+                                .or_else(|| {
+                                    measure_line_height::<Renderer>(self.buffer, line, desired)
+                                })
+                                .unwrap_or(line_height_px)
+                        };
+                        (anchor_line, anchor_offset) = scroll_by(
+                            anchor_line,
+                            anchor_offset,
+                            correction,
+                            n_lines,
+                            para_bounds.height,
+                            height_of,
+                        );
+                        (new_rows, width) = shape_window(anchor_line, anchor_offset, &new_rows);
+                    }
+                }
+
+                self.scroll_anchor.set((anchor_line, anchor_offset));
             }
             self.wheel_scrolled = false;
 
@@ -524,6 +660,20 @@ where
             let n_lines = self.buffer.len_lines();
             let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
 
+            let template = text_advanced::Text {
+                content: (),
+                bounds: para_bounds,
+                size,
+                line_height: self.line_height,
+                font,
+                align_x: self.align_x,
+                align_y: self.align_y,
+                shaping: Shaping::Advanced,
+                wrapping: self.wrapping,
+                ellipsis: self.ellipsis,
+                hint_factor: renderer.scale_factor(),
+            };
+
             // Prefer a row's actual shaped height when it's part of what's
             // currently on screen. Otherwise shape just that one line to
             // measure its *true* height rather than assuming one line's
@@ -534,62 +684,22 @@ where
             // what this scroll math assumed. Bounded cost: a wheel event
             // only ever walks a handful of lines past what's cached.
             let height_of = |line: usize| -> f32 {
-                if let Some(row) = line
-                    .checked_sub(state.anchor_line)
+                line.checked_sub(state.anchor_line)
                     .and_then(|i| state.rows.get(i))
-                {
-                    return row.height;
-                }
-
-                window_rows::<Renderer::Font>(self.buffer, line, 1)
-                    .first()
-                    .map(|(_, spans)| {
-                        Renderer::Paragraph::with_spans(text_advanced::Text {
-                            content: spans.as_slice(),
-                            bounds: para_bounds,
-                            size,
-                            line_height: self.line_height,
-                            font,
-                            align_x: self.align_x,
-                            align_y: self.align_y,
-                            shaping: Shaping::Advanced,
-                            wrapping: self.wrapping,
-                            ellipsis: self.ellipsis,
-                            hint_factor: renderer.scale_factor(),
-                        })
-                        .min_bounds()
-                        .height
-                    })
+                    .map(|row| row.height)
+                    .or_else(|| measure_line_height::<Renderer>(self.buffer, line, template))
                     .unwrap_or(line_height_px)
             };
 
-            let (mut line, mut offset) = self.scroll_anchor.get();
-            offset += delta_px;
-
-            while offset < 0.0 {
-                if line == 0 {
-                    offset = 0.0;
-                    break;
-                }
-                line -= 1;
-                offset += height_of(line);
-            }
-            while offset >= 0.0 {
-                let h = height_of(line);
-                if line + 1 >= n_lines {
-                    // The last line stops flush at the top: nothing below
-                    // it to scroll into, so no overscroll allowed here.
-                    offset = 0.0;
-                    break;
-                }
-                if offset < h {
-                    break;
-                }
-                offset -= h;
-                line += 1;
-            }
-
-            let new_anchor = (line, offset);
+            let (anchor_line, anchor_offset) = self.scroll_anchor.get();
+            let new_anchor = scroll_by(
+                anchor_line,
+                anchor_offset,
+                delta_px,
+                n_lines,
+                para_bounds.height,
+                height_of,
+            );
             if new_anchor != self.scroll_anchor.get() {
                 self.scroll_anchor.set(new_anchor);
                 shell.invalidate_layout();

@@ -720,4 +720,105 @@ mod tests {
             "viewport should have scrolled back up to reveal the cursor at the start"
         );
     }
+
+    /// Regression test: typing that makes the cursor's own line word-wrap
+    /// into extra visual rows — pushing its wrapped tail below the
+    /// viewport's bottom edge — used to leave the viewport unmoved. The old
+    /// scroll-into-view check only compared logical line *counts* against
+    /// the shaped window; a single wrapped row growing past the window's
+    /// pixel budget didn't change that count, so it looked "already in
+    /// view" even once its bottom ran off-screen mid-keystroke.
+    #[test]
+    fn typing_wraps_line_past_viewport_bottom_scrolls_to_follow() {
+        let mut editor = Editor::<()>::new(Rope::from_str(""));
+        for ch in "short\n".chars() {
+            editor.action(Action::Insert(ch));
+        }
+        // A long line typed at the end, narrow enough to wrap into many
+        // more visual rows than a small viewport can show at once.
+        for ch in "wrap ".repeat(20).chars() {
+            editor.action(Action::Insert(ch));
+        }
+
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(150.0, 80.0),
+            element,
+        );
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        let (anchor_line, anchor_offset) = editor.scroll_anchor.get();
+        assert!(
+            anchor_line > 0 || anchor_offset > 0.0,
+            "viewport should have scrolled to follow the cursor onto the wrapped \
+             line's overflowing tail, anchor stayed at (0, 0.0)"
+        );
+    }
+
+    /// Regression test: if the cursor's own line is only *partially* cut
+    /// off by the viewport's top edge (e.g. left mid-scrolled by a small
+    /// wheel nudge that didn't cross a whole line), the viewport should
+    /// still realign so the line is fully visible rather than treating
+    /// "the right logical line is somewhere in the window" as good enough.
+    #[test]
+    fn cursor_on_partially_scrolled_anchor_line_snaps_flush_to_top() {
+        let mut editor = Editor::<()>::new(Rope::from_str(""));
+        let mut text = String::new();
+        for i in 1..=10 {
+            text.push_str(&format!("line {i}\n"));
+        }
+        for ch in text.chars() {
+            editor.action(Action::Insert(ch));
+        }
+        for _ in 0..text.chars().count() {
+            editor.action(Action::MoveCursorLeft);
+        }
+        // Cursor is now at position 0, on line 0.
+
+        {
+            let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
+                editor.view().into();
+            let mut ui = iced_test::Simulator::with_size(
+                iced_test::core::Settings::default(),
+                iced_test::core::Size::new(200.0, 200.0),
+                element,
+            );
+            ui.point_at(iced_test::core::Point::new(50.0, 50.0));
+            let _ = ui.snapshot(&iced::Theme::Light);
+
+            // A small downward nudge, well under one line's height, so the
+            // anchor stays on line 0 but scrolls partway into it. The wheel
+            // event's own immediate relayout is wheel-driven, so
+            // scroll-into-view is deliberately suppressed for it — this
+            // partially-scrolled state is expected to persist past it.
+            ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -10.0 },
+            })]);
+        }
+        let (anchor_line, anchor_offset) = editor.scroll_anchor.get();
+        assert_eq!(anchor_line, 0);
+        assert!(
+            anchor_offset > 0.0,
+            "wheel nudge should have partially scrolled into line 0"
+        );
+
+        // A fresh layout pass (cursor still on line 0, not wheel-driven)
+        // should snap the anchor flush to that line's top rather than
+        // leaving it — and the cursor on it — cut off.
+        let element: iced::Element<'_, (), iced::Theme, iced::Renderer> = editor.view().into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced_test::core::Settings::default(),
+            iced_test::core::Size::new(200.0, 200.0),
+            element,
+        );
+        let _ = ui.snapshot(&iced::Theme::Light);
+
+        assert_eq!(
+            editor.scroll_anchor.get(),
+            (0, 0.0),
+            "cursor's own line was partially cut off at the top; \
+             the viewport should have snapped flush to it"
+        );
+    }
 }
