@@ -5,20 +5,19 @@ use std::sync::Arc;
 use iced::event::{self, Event};
 use iced::keyboard;
 use iced::keyboard::Key;
-use iced::keyboard::key::Named;
 use iced::widget::{column, container, text};
 use iced::{Element, Length, Subscription, Task};
-use ropey::Rope;
 
 use tracing::{debug, error, info};
 
 use crate::APP_ICON;
+use crate::keymap;
 use crate::message::{self, Message};
-use sputnik_editor::{Action, Editor};
+use sputnik_editor::{Action, Document, Editor, Interaction, Motion, Text};
 
 pub struct Application {
     window_id: iced::window::Id,
-    editor: Editor<Message>,
+    editor: Editor,
 }
 
 async fn load_file(path: PathBuf) -> Result<Arc<String>, (PathBuf, io::ErrorKind)> {
@@ -56,7 +55,7 @@ impl Application {
         (
             Self {
                 window_id: main_window_id,
-                editor: Editor::<Message>::new(Rope::new()),
+                editor: Editor::default(),
             },
             Task::batch(tasks),
         )
@@ -76,42 +75,24 @@ impl Application {
                     return close_task;
                 }
             },
-            Message::KeyboardInput { key, text } => match key {
-                Key::Named(Named::ArrowLeft) => {
-                    self.editor.action(Action::MoveCursorLeft);
+            Message::KeyboardInput {
+                key,
+                modifiers,
+                text,
+            } => {
+                if let Some(action) = keymap::action(&key, modifiers, text.as_ref()) {
+                    self.editor.perform(action);
                 }
-                Key::Named(Named::ArrowRight) => {
-                    self.editor.action(Action::MoveCursorRight);
-                }
-                Key::Named(Named::ArrowUp) => {
-                    self.editor.action(Action::MoveCursorUp);
-                }
-                Key::Named(Named::ArrowDown) => {
-                    self.editor.action(Action::MoveCursorDown);
-                }
-                Key::Named(Named::Backspace) => {
-                    self.editor.action(Action::DeleteBackward);
-                }
-                Key::Named(Named::Delete) => {
-                    self.editor.action(Action::DeleteForward);
-                }
-                Key::Named(Named::Tab) => {
-                    self.editor.action(Action::InsertTab);
-                }
-                Key::Named(Named::Space) => {
-                    self.editor.action(Action::Insert(' '));
-                }
-                Key::Named(Named::Enter) => {
-                    self.editor.action(Action::Insert('\n'));
-                }
+            }
 
-                _ => {
-                    if let Some(txt) = text {
-                        for c in txt.chars() {
-                            self.editor.action(Action::Insert(c));
-                        }
-                    }
-                }
+            // The widget reports *where* the mouse landed; deciding that a
+            // press places the caret and a drag extends the selection is
+            // this layer's call, and is all it would take to make the
+            // mouse behave differently.
+            Message::Editor(interaction) => match interaction {
+                Interaction::Press(at) => self.editor.perform(Action::Move(Motion::To(at))),
+                Interaction::Drag(at) => self.editor.perform(Action::Select(Motion::To(at))),
+                Interaction::Release => {}
             },
 
             Message::RequestOpenFile => {
@@ -126,7 +107,11 @@ impl Application {
             }
 
             Message::FileOpened(Ok(content)) => {
-                self.editor = Editor::new(Rope::from_str(&content));
+                // Not `Editor::from_str`: the widget's measurements
+                // describe the view, which has not changed, and dropping
+                // them would break wrap-aware motion until the next
+                // layout pass.
+                self.editor.open(Document::from_str(&content));
             }
             Message::FileOpened(Err((path, err))) => {
                 error!("Failed to open {}: {err:?}", path.display());
@@ -139,10 +124,16 @@ impl Application {
     }
 
     pub fn view(&self, _window_id: iced::window::Id) -> Element<'_, Message> {
+        let selection = self.editor.selection();
         let hud: Element<'_, Message> = text(format!(
-            "cursor: {}/{}",
+            "cursor: {}/{}{}",
             self.editor.cursor(),
-            self.editor.total_chars(),
+            self.editor.text_storage().len(),
+            if selection.is_empty() {
+                String::new()
+            } else {
+                format!("  ({} selected)", selection.range().len())
+            },
         ))
         .size(14.0)
         .color(iced::color!(0x666666))
@@ -155,8 +146,15 @@ impl Application {
         // editor to its own bounds wouldn't change anything). As column
         // siblings, the editor's `Fill` height excludes the HUD's `Shrink`
         // row instead.
+        let editor = self
+            .editor
+            .view()
+            .on_interaction(Message::Editor)
+            .show_line_numbers(true)
+            .size(24.0);
+
         container(
-            column![self.editor.view(), hud]
+            column![editor, hud]
                 .width(Length::Fill)
                 .height(Length::Fill),
         )
@@ -186,7 +184,11 @@ impl Application {
                     ..
                 }) => match key.as_ref() {
                     Key::Character("o") if modifiers.command() => Message::RequestOpenFile,
-                    _ => Message::KeyboardInput { key, text },
+                    _ => Message::KeyboardInput {
+                        key,
+                        modifiers,
+                        text,
+                    },
                 },
                 _ => Message::None,
             }),
@@ -219,24 +221,148 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Regression test for a real bug: the isolated `editor.view()` element
-    /// (used by the other snapshot tests) always starts at bounds origin
-    /// y≈0, so a scrolled-off row's unclipped overflow has nowhere to go
-    /// and the bug was invisible there. Reproducing the *actual*
-    /// `container(column![editor, hud]).padding(32.0)` composition — where
-    /// the editor's bounds start at a positive y and end above the HUD's
-    /// row — showed the real failure: without an explicit clip in
-    /// `EditorParagraph::draw`, a row scrolled partway off the top bled
-    /// into the padding above instead of visibly cropping, and a row
-    /// overflowing the bottom bled into the HUD's row instead of stopping
-    /// at the editor's own boundary.
+    /// Drives the real `update` path — the same one a keystroke takes —
+    /// so the wiring from key to keymap to document is covered, not just
+    /// the pieces on either side of it.
+    fn press(app: &mut Application, key: Key, modifiers: iced::keyboard::Modifiers) {
+        let text = match &key {
+            Key::Character(c) => Some(smol_str::SmolStr::new(c.as_str())),
+            _ => None,
+        };
+        let _ = app.update(Message::KeyboardInput {
+            key,
+            modifiers,
+            text,
+        });
+    }
+
+    fn app() -> Application {
+        Application::new(None).0
+    }
+
+    #[test]
+    fn typing_then_selecting_then_deleting_works_end_to_end() {
+        use iced::keyboard::Modifiers;
+        use iced::keyboard::key::Named;
+
+        let mut app = app();
+        for c in ["h", "i", "!"] {
+            press(&mut app, Key::Character(c.into()), Modifiers::empty());
+        }
+        assert_eq!(app.editor.text(), "hi!");
+
+        // Shift+Left twice selects the last two characters ...
+        press(&mut app, Key::Named(Named::ArrowLeft), Modifiers::SHIFT);
+        press(&mut app, Key::Named(Named::ArrowLeft), Modifiers::SHIFT);
+        assert_eq!(app.editor.document().selected_text(), "i!");
+
+        // ... and Backspace removes exactly them.
+        press(&mut app, Key::Named(Named::Backspace), Modifiers::empty());
+        assert_eq!(app.editor.text(), "h");
+        assert!(app.editor.selection().is_empty());
+    }
+
+    /// Opening a file must not throw away what the widget already measured
+    /// about the view. The viewport describes the *widget* — wrap width,
+    /// font size, how many rows fit — and the widget did not change; only
+    /// the text did. Resetting it left the next keystroke resolving
+    /// wrap-aware motions against defaults, most visibly making PageDown
+    /// travel a single row.
+    #[test]
+    fn opening_a_file_keeps_the_measured_viewport() {
+        use iced::keyboard::Modifiers;
+        use iced::keyboard::key::Named;
+
+        let mut app = app();
+        // A layout pass measures the real view.
+        {
+            let element: iced::Element<'_, Message, iced::Theme, iced::Renderer> =
+                app.view(app.window_id);
+            let mut ui = iced_test::Simulator::with_size(
+                iced_test::core::Settings::default(),
+                iced_test::core::Size::new(500.0, 400.0),
+                element,
+            );
+            let _ = ui.snapshot(&iced::Theme::Light);
+        }
+        let measured = app.editor.viewport();
+        assert!(
+            measured.visible_rows > 1,
+            "a 400px-tall viewport should fit more than one row"
+        );
+
+        let text: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+        let _ = app.update(Message::FileOpened(Ok(Arc::new(text))));
+
+        assert_eq!(
+            app.editor.viewport().scroll,
+            (0, 0.0),
+            "a newly opened file starts at the top"
+        );
+        assert_eq!(
+            app.editor.viewport().visible_rows,
+            measured.visible_rows,
+            "but the measurements survive"
+        );
+
+        // The discriminating check: a page must be a page, straight away.
+        press(&mut app, Key::Named(Named::PageDown), Modifiers::empty());
+        assert!(
+            app.editor.text_storage().line_of(app.editor.cursor()) > 1,
+            "PageDown right after opening a file moved only one row, which \
+             means it was resolved against a default one-row viewport"
+        );
+    }
+
+    #[test]
+    fn select_all_then_typing_replaces_the_whole_document() {
+        use iced::keyboard::Modifiers;
+
+        let mut app = app();
+        let _ = app.update(Message::FileOpened(Ok(Arc::new("throw away".into()))));
+        assert_eq!(app.editor.text(), "throw away");
+
+        press(&mut app, Key::Character("a".into()), Modifiers::CTRL);
+        press(&mut app, Key::Character("x".into()), Modifiers::empty());
+
+        assert_eq!(app.editor.text(), "x");
+    }
+
+    /// A press places the caret and a drag extends the selection — the
+    /// meaning this layer, not the widget, assigns to a mouse.
+    #[test]
+    fn a_press_then_a_drag_selects() {
+        use sputnik_editor::Interaction;
+
+        let mut app = app();
+        let _ = app.update(Message::FileOpened(Ok(Arc::new("hello world".into()))));
+
+        let _ = app.update(Message::Editor(Interaction::Press(6)));
+        assert!(
+            app.editor.selection().is_empty(),
+            "a press only moves the caret"
+        );
+
+        let _ = app.update(Message::Editor(Interaction::Drag(11)));
+        assert_eq!(app.editor.document().selected_text(), "world");
+
+        let _ = app.update(Message::Editor(Interaction::Release));
+        assert_eq!(app.editor.document().selected_text(), "world");
+    }
+
+    /// Rows are shaped independently of where they land, so one scrolled
+    /// partway off an edge still renders its full height and must be
+    /// clipped to the editor's own bounds.
+    ///
+    /// Only the real composition can show this. A bare `editor.view()`
+    /// starts at bounds origin y≈0, where overflow has nowhere to go;
+    /// inside `container(column![editor, hud]).padding(32.0)` the editor
+    /// begins at a positive y and ends above the HUD, so anything
+    /// unclipped bleeds into the padding above or the HUD below.
     #[test]
     fn scrolled_content_clips_to_editor_bounds_not_surroundings() {
         let readme = std::fs::read_to_string(INITIAL_FILE).expect("README.md should exist");
-        let mut editor = Editor::<()>::new(Rope::from_str(""));
-        for ch in readme.chars() {
-            editor.action(Action::Insert(ch));
-        }
+        let editor: Editor = Editor::from_str(&readme);
 
         let hud: iced::Element<'_, (), iced::Theme, iced::Renderer> =
             text("cursor: 0/0").size(14.0).into();

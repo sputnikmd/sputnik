@@ -2,6 +2,7 @@
 
 mod application;
 mod cli;
+mod keymap;
 mod message;
 
 use clap::Parser;

@@ -3584,7 +3584,6 @@ dependencies = [
  "iced",
  "iced_test",
  "rfd",
- "ropey",
  "smol_str 0.2.2",
  "sputnik_editor",
  "tokio",
